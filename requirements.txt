@@ -1,0 +1,8 @@
+# AgentGym — Zero-dependency design
+#
+# This project uses only Python standard library modules:
+#   subprocess, json, hashlib, difflib, ast, re, tempfile, pathlib, etc.
+#
+# External requirement:
+#   - `claude` CLI must be installed and available on PATH
+#     Install: npm install -g @anthropic-ai/claude-code
