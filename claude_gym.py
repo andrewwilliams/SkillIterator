@@ -89,6 +89,7 @@ class ClaudeGym:
         system_prompt: str | None = None,
         allowed_tools: list[str] | None = None,
         stream_callback: Callable[[dict], None] | None = None,
+        interactive: bool = False,
     ):
         self._owns_work_dir = work_dir is None
         if work_dir is None:
@@ -105,6 +106,7 @@ class ClaudeGym:
         self.system_prompt = system_prompt
         self.allowed_tools = allowed_tools
         self.stream_callback = stream_callback
+        self.interactive = interactive
 
         self._session_id: str | None = None
         self.conversation_log = ConversationLog()
@@ -121,6 +123,9 @@ class ClaudeGym:
         return False
 
     def _build_command(self, prompt: str, resume_session: str | None = None) -> list[str]:
+        if self.interactive:
+            return self._build_interactive_command(prompt, resume_session)
+
         cmd = [
             "claude",
             "-p", prompt,
@@ -149,6 +154,30 @@ class ClaudeGym:
 
         if self.allowed_tools:
             cmd.extend(["--allowedTools"] + self.allowed_tools)
+
+        return cmd
+
+    def _build_interactive_command(self, prompt: str, resume_session: str | None = None) -> list[str]:
+        cmd = ["claude"]
+
+        if resume_session:
+            cmd.extend(["--resume", resume_session])
+
+        if self.model:
+            cmd.extend(["--model", self.model])
+
+        # No --max-turns in interactive mode: the user controls the session
+        if self.max_budget_usd is not None:
+            cmd.extend(["--max-budget-usd", str(self.max_budget_usd)])
+
+        if self.system_prompt:
+            cmd.extend(["--system-prompt", self.system_prompt])
+
+        if self.allowed_tools:
+            cmd.extend(["--allowedTools"] + self.allowed_tools)
+
+        # Prompt goes as positional argument at the end
+        cmd.append(prompt)
 
         return cmd
 
@@ -300,6 +329,9 @@ class ClaudeGym:
 
     def send_prompt(self, prompt: str, timeout: int = 300) -> TurnResult:
         """Send a prompt to claude and return structured results."""
+        if self.interactive:
+            return self._send_prompt_interactive(prompt)
+
         t0 = time.time()
 
         # Snapshot before
@@ -386,6 +418,50 @@ class ClaudeGym:
             is_error=is_error,
             raw_events=events,
             tool_uses=tool_uses,
+            file_diffs=file_diffs,
+        )
+        self.conversation_log.turns.append(turn)
+        return turn
+
+    def _send_prompt_interactive(self, prompt: str) -> TurnResult:
+        """Run claude interactively, letting it own the terminal.
+
+        The user can interact with Claude directly (answer questions,
+        approve plan mode, etc.). File diffs are computed from before/after
+        snapshots. Structured event data (cost, turns) is not available.
+        """
+        t0 = time.time()
+
+        before = self._snapshot_directory()
+
+        cmd = self._build_command(prompt, resume_session=self._session_id)
+        if self.debug_mode:
+            print(f"\n>>> Interactive mode", file=sys.stderr, flush=True)
+            print(f">>> Command: {' '.join(cmd[:8])}...", file=sys.stderr, flush=True)
+
+        # Let Claude own stdin/stdout/stderr for full interactivity
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(self._work_dir),
+            env=self._build_env(),
+        )
+        process.wait()
+
+        duration = time.time() - t0
+
+        after = self._snapshot_directory()
+        file_diffs = self._compute_diffs(before, after)
+
+        turn = TurnResult(
+            prompt=prompt,
+            result_text="(interactive session)",
+            session_id=None,
+            num_turns=0,
+            cost_usd=0.0,
+            duration=duration,
+            is_error=process.returncode != 0,
+            raw_events=[],
+            tool_uses=[],
             file_diffs=file_diffs,
         )
         self.conversation_log.turns.append(turn)

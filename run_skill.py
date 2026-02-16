@@ -419,6 +419,13 @@ def main() -> int:
             continue
         break
 
+    interactive_input = input("\nInteractive mode? (y/n) [n]: ").strip().lower()
+    interactive = interactive_input == "y"
+    if interactive:
+        print("Claude will run interactively — you can answer questions and approve plans.")
+    else:
+        print("Claude will run headless (non-interactive).")
+
     branch = get_git_branch(project_dir)
     print(f"\nProject: {project_dir}")
     print(f"Branch:  {branch}")
@@ -448,7 +455,8 @@ def main() -> int:
         gym = ClaudeGym(
             work_dir=project_dir,
             system_prompt=skill,
-            debug_mode=True,
+            debug_mode=not interactive,
+            interactive=interactive,
         )
         turn = gym.send_prompt(task_prompt)
 
@@ -461,8 +469,11 @@ def main() -> int:
 
         # Show results
         show_file_changes(turn.file_diffs)
-        print(f"\nResponse: {turn.result_text[:500]}{'...' if len(turn.result_text) > 500 else ''}")
-        print(f"Cost: ${turn.cost_usd:.4f} | Duration: {turn.duration:.1f}s | Turns: {turn.num_turns}")
+        if not interactive:
+            print(f"\nResponse: {turn.result_text[:500]}{'...' if len(turn.result_text) > 500 else ''}")
+            print(f"Cost: ${turn.cost_usd:.4f} | Duration: {turn.duration:.1f}s | Turns: {turn.num_turns}")
+        else:
+            print(f"\nSession duration: {turn.duration:.1f}s")
 
         if turn.is_error:
             print("*** ERROR in Claude response ***")
