@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,69 @@ from evaluator import (
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+SKILLS_DIR = Path.home() / ".claude" / "skills"
+
+
+def discover_skills() -> list[dict[str, str]]:
+    """Scan ~/.claude/skills/ for SKILL.md files and parse their frontmatter."""
+    skills: list[dict[str, str]] = []
+    if not SKILLS_DIR.is_dir():
+        return skills
+    for skill_dir in sorted(SKILLS_DIR.iterdir()):
+        skill_file = skill_dir / "SKILL.md"
+        if not skill_file.is_file():
+            continue
+        content = skill_file.read_text()
+        # Parse YAML frontmatter (between --- delimiters)
+        fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+        name = skill_dir.name
+        description = ""
+        if fm_match:
+            for line in fm_match.group(1).splitlines():
+                if line.startswith("name:"):
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("description:"):
+                    description = line.split(":", 1)[1].strip()
+        skills.append({
+            "name": name,
+            "description": description,
+            "content": content,
+            "path": str(skill_file),
+        })
+    return skills
+
+
+def select_skill(skills: list[dict[str, str]]) -> str:
+    """Present available skills and return the chosen skill content."""
+    while True:
+        if skills:
+            print("Available skills:")
+            for i, s in enumerate(skills, 1):
+                desc = f" — {s['description'][:70]}" if s["description"] else ""
+                print(f"  {i}. {s['name']}{desc}")
+            print(f"  {len(skills) + 1}. Custom (enter manually)")
+            choice = input(f"\nSelect skill [1-{len(skills) + 1}]: ").strip()
+            if choice.isdigit():
+                idx = int(choice)
+                if 1 <= idx <= len(skills):
+                    selected = skills[idx - 1]
+                    print(f"\nLoaded: {selected['name']}")
+                    return selected["content"]
+                elif idx == len(skills) + 1:
+                    # Fall through to manual entry
+                    pass
+                else:
+                    print(f"Invalid choice. Enter a number from 1 to {len(skills) + 1}.\n")
+                    continue
+            else:
+                print(f"Invalid choice. Enter a number from 1 to {len(skills) + 1}.\n")
+                continue
+
+        # Manual entry (either no skills found or user chose Custom)
+        skill = get_multiline_input("\nSkill (system prompt — end with blank line):")
+        if skill.strip():
+            return skill
+        print("Error: skill cannot be empty.\n")
 
 
 def check_prerequisites() -> str | None:
@@ -331,27 +395,29 @@ def main() -> int:
         return 1
 
     # --- Collect inputs ---
-    skill = get_multiline_input("Skill (system prompt — end with blank line):")
-    if not skill.strip():
-        print("Error: skill cannot be empty.")
-        return 1
+    skills = discover_skills()
+    skill = select_skill(skills)
 
-    task_prompt = get_multiline_input("\nTask prompt (end with blank line):")
-    if not task_prompt.strip():
-        print("Error: task prompt cannot be empty.")
-        return 1
+    while True:
+        task_prompt = get_multiline_input("\nTask prompt (end with blank line):")
+        if task_prompt.strip():
+            break
+        print("Error: task prompt cannot be empty.\n")
 
-    project_dir_str = input("\nProject directory: ").strip()
-    project_dir = Path(os.path.expanduser(project_dir_str)).resolve()
-    if not project_dir.is_dir():
-        print(f"Error: {project_dir} is not a directory.")
-        return 1
-
-    # --- Validate project directory ---
-    dir_err = validate_project_dir(project_dir)
-    if dir_err:
-        print(f"Error: {dir_err}")
-        return 1
+    while True:
+        project_dir_str = input("\nProject directory: ").strip()
+        if not project_dir_str:
+            print("Error: please enter a directory path.\n")
+            continue
+        project_dir = Path(os.path.expanduser(project_dir_str)).resolve()
+        if not project_dir.is_dir():
+            print(f"Error: {project_dir} is not a directory.\n")
+            continue
+        dir_err = validate_project_dir(project_dir)
+        if dir_err:
+            print(f"Error: {dir_err}\n")
+            continue
+        break
 
     branch = get_git_branch(project_dir)
     print(f"\nProject: {project_dir}")
