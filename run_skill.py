@@ -483,8 +483,13 @@ def main() -> int:
             checks = run_evaluation(project_dir, file_exps, cmd_exps)
             print_evaluation(checks)
 
-        # Collect feedback
-        feedback = get_multiline_input("\nFeedback (or 'done'):")
+        # Collect feedback via web diff review UI or terminal
+        if turn.file_diffs:
+            from diff_server import present_diff_for_review
+            feedback = present_diff_for_review(turn.file_diffs)
+        else:
+            feedback = get_multiline_input("\nFeedback (or 'done'):")
+
         if feedback.strip().lower() == "done":
             print("\nDone.")
             break
