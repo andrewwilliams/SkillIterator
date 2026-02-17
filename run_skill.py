@@ -4,11 +4,13 @@ Interactive Skill Evaluator — define a skill, test it on a real project,
 collect freeform feedback, derive evaluation criteria, and iterate.
 
 Usage:
-    python3 run_skill.py
+    python3 run_skill.py          # Normal: exploratory first run
+    python3 run_skill.py --eval   # Skip to evaluation: provide expectations upfront
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -99,7 +101,7 @@ def check_prerequisites() -> str | None:
     return None
 
 
-def validate_project_dir(project_dir: Path) -> str | None:
+def validate_project_dir(project_dir: Path, *, skip_clean_check: bool = False) -> str | None:
     """Return an error message if the project dir is unsafe, else None."""
     # Block dangerous directories
     home = Path.home().resolve()
@@ -120,24 +122,25 @@ def validate_project_dir(project_dir: Path) -> str | None:
         return f"{project_dir} is not a git repository. Only git-tracked projects are supported."
 
     # Working tree must be clean (no uncommitted changes)
-    try:
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        return f"Could not run git status: {e}"
+    if not skip_clean_check:
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            return f"Could not run git status: {e}"
 
-    if status.stdout.strip():
-        dirty_count = len(status.stdout.strip().splitlines())
-        return (
-            f"Working tree has {dirty_count} uncommitted change(s). "
-            "Commit or stash them first so we can safely revert between runs.\n"
-            "  Hint: git stash  OR  git commit -am 'wip'"
-        )
+        if status.stdout.strip():
+            dirty_count = len(status.stdout.strip().splitlines())
+            return (
+                f"Working tree has {dirty_count} uncommitted change(s). "
+                "Commit or stash them first so we can safely revert between runs.\n"
+                "  Hint: git stash  OR  git commit -am 'wip'"
+            )
 
     return None
 
@@ -355,6 +358,29 @@ def show_expectations(
             print(f"      Stdout contains: {', '.join(ce.stdout_contains)}")
 
 
+def collect_and_derive_expectations(
+    feedback: str, project_dir: Path, task_prompt: str
+) -> tuple[list[FileExpectation], list[CommandExpectation]]:
+    """Derive expectations from feedback, show them, and prompt for acceptance."""
+    print("\n[Deriving expectations from feedback...]")
+    file_exps, cmd_exps = derive_expectations(
+        feedback, str(project_dir), task_prompt
+    )
+
+    if not file_exps and not cmd_exps:
+        print("Could not derive expectations.")
+        return [], []
+
+    show_expectations(file_exps, cmd_exps)
+
+    accept = input("\nAccept? (y/n): ").strip().lower()
+    if accept != "y":
+        print("Expectations rejected.")
+        return [], []
+
+    return file_exps, cmd_exps
+
+
 def run_evaluation(
     project_dir: Path,
     file_exps: list[FileExpectation],
@@ -386,6 +412,11 @@ def print_evaluation(checks: list[CheckResult]) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Interactive Skill Evaluator")
+    parser.add_argument("--eval", action="store_true",
+                        help="Skip exploratory run — provide expectations upfront")
+    args = parser.parse_args()
+
     print("=== Skill Evaluator ===\n")
 
     # --- Prerequisites ---
@@ -413,7 +444,7 @@ def main() -> int:
         if not project_dir.is_dir():
             print(f"Error: {project_dir} is not a directory.\n")
             continue
-        dir_err = validate_project_dir(project_dir)
+        dir_err = validate_project_dir(project_dir, skip_clean_check=args.eval)
         if dir_err:
             print(f"Error: {dir_err}\n")
             continue
@@ -430,9 +461,20 @@ def main() -> int:
     print(f"\nProject: {project_dir}")
     print(f"Branch:  {branch}")
 
-    # --- Loop state ---
+    # --- Pre-loop expectations (--eval mode) ---
     file_exps: list[FileExpectation] = []
     cmd_exps: list[CommandExpectation] = []
+
+    if args.eval:
+        feedback = get_multiline_input(
+            "\nExpectations feedback (describe what the output should look like — end with blank line):"
+        )
+        if feedback.strip():
+            file_exps, cmd_exps = collect_and_derive_expectations(
+                feedback, project_dir, task_prompt
+            )
+
+    # --- Loop state ---
     run_number = 0
     created_files: list[str] = []
     modified_files: list[str] = []
@@ -499,25 +541,15 @@ def main() -> int:
             continue
 
         # Derive expectations from feedback
-        print("\n[Deriving expectations from feedback...]")
-        new_file_exps, new_cmd_exps = derive_expectations(
-            feedback, str(project_dir), task_prompt
+        new_file_exps, new_cmd_exps = collect_and_derive_expectations(
+            feedback, project_dir, task_prompt
         )
 
-        if not new_file_exps and not new_cmd_exps:
-            print("Could not derive expectations. Running again with existing ones...")
-            continue
-
-        file_exps = new_file_exps
-        cmd_exps = new_cmd_exps
-
-        show_expectations(file_exps, cmd_exps)
-
-        accept = input("\nAccept? (y/n): ").strip().lower()
-        if accept != "y":
-            print("Expectations rejected. Provide new feedback on the next run.")
-            file_exps = []
-            cmd_exps = []
+        if new_file_exps or new_cmd_exps:
+            file_exps = new_file_exps
+            cmd_exps = new_cmd_exps
+        else:
+            print("Running again with existing expectations...")
 
     return 0
 
