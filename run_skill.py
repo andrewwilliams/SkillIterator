@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -466,10 +467,26 @@ def main() -> int:
     cmd_exps: list[CommandExpectation] = []
 
     if args.eval:
-        feedback = get_multiline_input(
-            "\nExpectations feedback (describe what the output should look like — end with blank line):"
-        )
-        if feedback.strip():
+        # Compute diffs from the dirty working tree using ClaudeGym's snapshot/diff logic
+        gym = ClaudeGym(work_dir=project_dir)
+        after = gym._snapshot_directory()
+        # Stash changes to get the clean baseline, then restore
+        subprocess.run(["git", "stash", "--include-untracked"], cwd=str(project_dir),
+                        capture_output=True, timeout=30)
+        before = gym._snapshot_directory()
+        subprocess.run(["git", "stash", "pop"], cwd=str(project_dir),
+                        capture_output=True, timeout=30)
+        eval_diffs = gym._compute_diffs(before, after)
+
+        if eval_diffs:
+            show_file_changes(eval_diffs)
+            from diff_server import present_diff_for_review
+            feedback = present_diff_for_review(eval_diffs)
+        else:
+            print("\nNo uncommitted changes found.")
+            feedback = get_multiline_input("\nFeedback (or 'done'):")
+
+        if feedback.strip().lower() != "done" and feedback.strip():
             file_exps, cmd_exps = collect_and_derive_expectations(
                 feedback, project_dir, task_prompt
             )
@@ -479,12 +496,20 @@ def main() -> int:
     created_files: list[str] = []
     modified_files: list[str] = []
 
+    # Track existing dirty-tree changes so Run 1 can revert them in --eval mode
+    if args.eval and eval_diffs:
+        for diff in eval_diffs:
+            if diff.status == "added":
+                created_files.append(diff.path)
+            elif diff.status == "modified":
+                modified_files.append(diff.path)
+
     while True:
         run_number += 1
         has_expectations = bool(file_exps or cmd_exps)
 
-        # Revert previous changes before re-running
-        if run_number > 1:
+        # Revert previous changes before re-running (including --eval dirty tree on Run 1)
+        if run_number > 1 or (args.eval and (created_files or modified_files)):
             print("\n[Reverting previous changes...]")
             revert_changes(project_dir, created_files, modified_files)
             created_files = []
