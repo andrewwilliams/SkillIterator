@@ -589,6 +589,21 @@ def main() -> int:
                 feedback, project_dir, task_prompt
             )
 
+            # Propose skill update based on feedback
+            print("\n[Proposing skill update...]")
+            revised_skill = derive_skill_update(
+                skill, feedback, task_prompt
+            )
+            if revised_skill:
+                print("\nProposed skill changes:")
+                show_skill_diff(skill, revised_skill)
+                accept = input("\nApply skill update? (y/n): ").strip().lower()
+                if accept == "y":
+                    skill = revised_skill
+                    print("Skill updated for next run.")
+                else:
+                    print("Skill unchanged.")
+
     # --- Loop state ---
     run_number = 0
     created_files: list[str] = []
