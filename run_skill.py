@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -381,6 +382,104 @@ def collect_and_derive_expectations(
     return file_exps, cmd_exps
 
 
+def derive_skill_update(
+    current_skill: str,
+    feedback: str,
+    task_prompt: str,
+    checks: list[CheckResult] | None = None,
+) -> str | None:
+    """Call Claude to propose a revised skill based on feedback and evaluation results."""
+    eval_context = ""
+    if checks:
+        results = []
+        for c in checks:
+            icon = "PASS" if c.passed else "FAIL"
+            results.append(f"  [{icon}] {c.message}")
+            if c.details and not c.passed:
+                for line in c.details.splitlines()[:2]:
+                    results.append(f"         {line}")
+        eval_context = "\n\nAutomated evaluation results:\n" + "\n".join(results)
+
+    revision_prompt = f"""You are revising a "skill" — a system prompt that instructs Claude Code to perform a specific coding task. The skill was tested and the output had issues.
+
+Current skill:
+---
+{current_skill}
+---
+
+Task that was given to Claude:
+{task_prompt}
+
+User feedback on Claude's output:
+{feedback}{eval_context}
+
+Revise the skill to address the feedback. Guidelines:
+- Make TARGETED changes — only modify/add what's needed to fix the reported issues.
+- Preserve all instructions that are working correctly.
+- Be specific and prescriptive (e.g., "Always use @Test macro, never use XCTest" not "use the correct testing framework").
+- When Claude used wrong patterns, add explicit "DO: ... / DO NOT: ..." rules.
+- Don't add unnecessary verbosity or redundant instructions.
+- Preserve any YAML frontmatter (--- delimited) exactly as-is.
+
+Return ONLY the complete revised skill text. No explanation, no markdown fences, no preamble."""
+
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", revision_prompt],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env=_build_clean_env(),
+        )
+
+        revised = proc.stdout.strip()
+        if not revised:
+            return None
+
+        # Strip markdown fences if Claude wrapped them
+        if revised.startswith("```"):
+            lines = revised.split("\n")
+            lines = [l for l in lines if not l.startswith("```")]
+            revised = "\n".join(lines)
+
+        # If unchanged, return None
+        if revised.strip() == current_skill.strip():
+            return None
+
+        return revised
+
+    except subprocess.TimeoutExpired:
+        print("\nError: skill revision call timed out.")
+        return None
+    except Exception as e:
+        print(f"\nError during skill revision: {e}")
+        return None
+
+
+def show_skill_diff(old_skill: str, new_skill: str) -> None:
+    """Display a unified diff of old vs new skill."""
+    old_lines = old_skill.splitlines(keepends=True)
+    new_lines = new_skill.splitlines(keepends=True)
+    diff = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile="current skill", tofile="proposed skill",
+    ))
+    if diff:
+        for line in diff:
+            # Colorize: green for additions, red for removals
+            if line.startswith("+") and not line.startswith("+++"):
+                print(f"\033[32m{line}\033[0m", end="")
+            elif line.startswith("-") and not line.startswith("---"):
+                print(f"\033[31m{line}\033[0m", end="")
+            elif line.startswith("@@"):
+                print(f"\033[36m{line}\033[0m", end="")
+            else:
+                print(line, end="")
+        print()  # Ensure trailing newline
+    else:
+        print("(no visible changes)")
+
+
 def run_evaluation(
     project_dir: Path,
     file_exps: list[FileExpectation],
@@ -545,6 +644,7 @@ def main() -> int:
             print("*** ERROR in Claude response ***")
 
         # Auto-evaluate if we have expectations
+        checks: list[CheckResult] = []
         if has_expectations:
             checks = run_evaluation(project_dir, file_exps, cmd_exps)
             print_evaluation(checks)
@@ -574,6 +674,23 @@ def main() -> int:
             cmd_exps = new_cmd_exps
         else:
             print("Running again with existing expectations...")
+
+        # Propose skill update based on feedback
+        print("\n[Proposing skill update...]")
+        revised_skill = derive_skill_update(
+            skill, feedback, task_prompt, checks or None
+        )
+        if revised_skill:
+            print("\nProposed skill changes:")
+            show_skill_diff(skill, revised_skill)
+            accept = input("\nApply skill update? (y/n): ").strip().lower()
+            if accept == "y":
+                skill = revised_skill
+                print("Skill updated for next run.")
+            else:
+                print("Skill unchanged.")
+        else:
+            print("No skill changes proposed.")
 
     return 0
 

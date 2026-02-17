@@ -220,8 +220,33 @@ body {
 .d2h-wrapper { background: transparent !important; }
 .d2h-file-wrapper { border: none !important; margin: 0 !important; border-radius: 0 !important; }
 .d2h-file-header { display: none !important; }
-.d2h-code-linenumber { background: var(--surface) !important; color: var(--text-muted) !important; border-color: var(--border) !important; cursor: pointer; }
+.d2h-code-linenumber { background: var(--surface) !important; color: var(--text-muted) !important; border-color: var(--border) !important; cursor: pointer; position: relative; }
+.d2h-code-linenumber::before {
+  content: '+';
+  position: absolute;
+  left: -8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #1e1e2e;
+  font-size: 14px;
+  font-weight: 700;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 10;
+}
+.d2h-code-linenumber:hover::before { display: flex; }
 .d2h-code-linenumber:hover { background: var(--comment-bg) !important; color: var(--accent) !important; }
+tr.line-selected > td { background: rgba(137, 180, 250, 0.08) !important; }
+tr.line-selected .d2h-code-linenumber { background: rgba(137, 180, 250, 0.15) !important; color: var(--accent) !important; }
+.raw-diff tr.line-selected .raw-line-num { background: rgba(137, 180, 250, 0.15) !important; color: var(--accent) !important; }
+.raw-diff tr.line-selected .raw-line-content { background: rgba(137, 180, 250, 0.08) !important; }
+body.is-dragging { user-select: none; -webkit-user-select: none; cursor: grabbing; }
 .d2h-code-line { background: var(--bg) !important; color: var(--text) !important; }
 .d2h-code-line-ctn { background: transparent !important; }
 .d2h-del { background: rgba(243, 139, 168, 0.1) !important; }
@@ -234,16 +259,51 @@ table.d2h-diff-table { font-family: 'SF Mono', 'Fira Code', monospace; font-size
 
 /* Fallback raw diff */
 .raw-diff {
-  padding: 16px;
   font-family: 'SF Mono', 'Fira Code', monospace;
   font-size: 13px;
-  white-space: pre-wrap;
-  word-break: break-all;
   overflow-x: auto;
 }
-.raw-diff .add { color: var(--green); }
-.raw-diff .del { color: var(--red); }
-.raw-diff .hunk { color: var(--accent); }
+.raw-diff table { width: 100%; border-collapse: collapse; }
+.raw-diff .raw-line-num {
+  width: 50px;
+  text-align: right;
+  padding: 0 8px;
+  color: var(--text-muted);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+  position: relative;
+}
+.raw-diff .raw-line-num::before {
+  content: '+';
+  position: absolute;
+  left: -8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #1e1e2e;
+  font-size: 14px;
+  font-weight: 700;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 10;
+}
+.raw-diff .raw-line-num:hover::before { display: flex; }
+.raw-diff .raw-line-num:hover { background: var(--comment-bg); color: var(--accent); }
+.raw-diff .raw-line-content {
+  padding: 0 16px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.raw-diff .add .raw-line-content { color: var(--green); }
+.raw-diff .del .raw-line-content { color: var(--red); }
+.raw-diff .hunk .raw-line-content { color: var(--accent); }
 
 /* Inline comment form */
 .inline-comment {
@@ -400,6 +460,16 @@ table.d2h-diff-table { font-family: 'SF Mono', 'Fira Code', monospace; font-size
 }
 
 .comment-count.visible { display: inline; }
+
+.hint-bar {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 24px;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: center;
+}
+.hint-bar .hint-icon { color: var(--accent); margin-right: 4px; }
 </style>
 </head>
 <body>
@@ -410,6 +480,7 @@ table.d2h-diff-table { font-family: 'SF Mono', 'Fira Code', monospace; font-size
   </div>
   <div class="file-count" id="fileCount"></div>
 </div>
+<div class="hint-bar"><span class="hint-icon">+</span>Click a line number to comment · Drag across lines to select a range</div>
 
 <div class="container">
   <div id="diffContainer"></div>
@@ -431,6 +502,9 @@ window.__DIFF_DATA__ = __DIFF_DATA_PLACEHOLDER__;
 
 const comments = []; // {file_path, start_line, end_line, comment}
 let activeCommentForm = null;
+let isDragging = false;
+let dragAnchor = null; // {row, lineNum, filePath, fileIdx}
+let dragCurrent = null; // {row, lineNum}
 
 function init() {
   const container = document.getElementById('diffContainer');
@@ -483,8 +557,10 @@ function renderDiff(container, unifiedDiff, filePath, fileIdx) {
       });
       diff2htmlUi.draw();
 
-      // Add click handlers to line numbers
-      setTimeout(function() { attachLineClickHandlers(target, filePath, fileIdx); }, 100);
+      // Add click handlers once diff2html finishes rendering
+      waitForLineNumbers(target, function() {
+        attachLineClickHandlers(target, filePath, fileIdx);
+      });
       return;
     } catch (e) {
       console.warn('diff2html failed, falling back to raw:', e);
@@ -492,50 +568,108 @@ function renderDiff(container, unifiedDiff, filePath, fileIdx) {
   }
 
   // Fallback: raw diff with basic coloring
-  renderRawDiff(container, unifiedDiff);
+  renderRawDiff(container, unifiedDiff, filePath, fileIdx);
 }
 
-function renderRawDiff(container, unifiedDiff) {
-  const pre = document.createElement('div');
-  pre.className = 'raw-diff';
+function renderRawDiff(container, unifiedDiff, filePath, fileIdx) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'raw-diff';
+  const table = document.createElement('table');
+  const tbody = document.createElement('tbody');
+  table.appendChild(tbody);
+
   const lines = unifiedDiff.split('\n');
+  let lineNum = 0;
+  // Parse hunk headers to track actual line numbers
   lines.forEach(function(line) {
-    const span = document.createElement('span');
+    const tr = document.createElement('tr');
+    let rowClass = '';
     if (line.startsWith('+') && !line.startsWith('+++')) {
-      span.className = 'add';
+      rowClass = 'add';
+      lineNum++;
     } else if (line.startsWith('-') && !line.startsWith('---')) {
-      span.className = 'del';
+      rowClass = 'del';
     } else if (line.startsWith('@@')) {
-      span.className = 'hunk';
+      rowClass = 'hunk';
+      // Parse new-file line number from @@ -a,b +c,d @@
+      const match = line.match(/\+(\d+)/);
+      if (match) lineNum = parseInt(match[1], 10) - 1;
+    } else if (!line.startsWith('---') && !line.startsWith('+++')) {
+      lineNum++;
     }
-    span.textContent = line;
-    pre.appendChild(span);
-    pre.appendChild(document.createTextNode('\n'));
+    if (rowClass) tr.className = rowClass;
+
+    const tdNum = document.createElement('td');
+    tdNum.className = 'raw-line-num';
+    // Show line number for context and added lines (not deleted/hunk/header)
+    if (rowClass !== 'del' && rowClass !== 'hunk' && !line.startsWith('---') && !line.startsWith('+++') && lineNum > 0) {
+      tdNum.textContent = lineNum;
+      (function(capturedLine) {
+        tdNum.addEventListener('mousedown', function(e) {
+          if (e.button !== 0) return;
+          e.stopPropagation();
+          handleDragStart(e, tr, capturedLine, filePath, fileIdx);
+        });
+      })(lineNum);
+    }
+
+    const tdContent = document.createElement('td');
+    tdContent.className = 'raw-line-content';
+    tdContent.textContent = line;
+
+    tr.appendChild(tdNum);
+    tr.appendChild(tdContent);
+    tbody.appendChild(tr);
   });
-  container.appendChild(pre);
+
+  wrapper.appendChild(table);
+  container.appendChild(wrapper);
+}
+
+function waitForLineNumbers(target, callback) {
+  // If line numbers already exist, run immediately
+  if (target.querySelector('.d2h-code-linenumber')) {
+    callback();
+    return;
+  }
+  // Otherwise watch for DOM mutations until they appear
+  var observer = new MutationObserver(function(mutations, obs) {
+    if (target.querySelector('.d2h-code-linenumber')) {
+      obs.disconnect();
+      callback();
+    }
+  });
+  observer.observe(target, { childList: true, subtree: true });
+  // Safety timeout: stop watching after 3s and try anyway
+  setTimeout(function() {
+    observer.disconnect();
+    callback();
+  }, 3000);
 }
 
 function attachLineClickHandlers(target, filePath, fileIdx) {
   const lineNumbers = target.querySelectorAll('.d2h-code-linenumber');
   lineNumbers.forEach(function(ln) {
-    ln.addEventListener('click', function(e) {
+    ln.addEventListener('mousedown', function(e) {
+      if (e.button !== 0) return;
       e.stopPropagation();
-      // Extract line number from the element
-      const numEl = ln.querySelector('.line-num2') || ln.querySelector('.line-num1');
-      let lineNum = 0;
-      if (numEl) {
-        lineNum = parseInt(numEl.textContent.trim(), 10) || 0;
-      }
+      var numEl = ln.querySelector('.line-num2') || ln.querySelector('.line-num1');
+      var lineNum = 0;
+      if (numEl) lineNum = parseInt(numEl.textContent.trim(), 10) || 0;
       if (lineNum > 0) {
-        openCommentForm(ln.closest('tr'), filePath, lineNum, fileIdx);
+        handleDragStart(e, ln.closest('tr'), lineNum, filePath, fileIdx);
       }
     });
   });
 }
 
-function openCommentForm(afterRow, filePath, lineNum, fileIdx) {
-  // Remove any existing comment form
-  closeCommentForm();
+function openCommentForm(afterRow, filePath, startLine, fileIdx, endLine) {
+  endLine = endLine || startLine;
+  // Remove any existing comment form but keep highlights
+  if (activeCommentForm) { activeCommentForm.remove(); activeCommentForm = null; }
+
+  var lineRef = startLine === endLine ? 'L' + startLine : 'L' + startLine + '\u2013' + endLine;
+  var placeholder = startLine === endLine ? 'Add a comment about this line...' : 'Add a comment about these lines...';
 
   const tr = document.createElement('tr');
   tr.className = 'inline-comment-row';
@@ -543,10 +677,10 @@ function openCommentForm(afterRow, filePath, lineNum, fileIdx) {
   td.colSpan = 10;
   td.innerHTML =
     '<div class="inline-comment">' +
-      '<span class="line-ref">L' + lineNum + '</span>' +
-      '<textarea id="commentInput" placeholder="Add a comment about this line..." autofocus></textarea>' +
+      '<span class="line-ref">' + lineRef + '</span>' +
+      '<textarea id="commentInput" placeholder="' + placeholder + '" autofocus></textarea>' +
       '<div style="display:flex;flex-direction:column;gap:4px">' +
-        '<button class="btn-sm" onclick="saveComment(\'' + escapeAttr(filePath) + '\',' + lineNum + ',' + fileIdx + ')">Add</button>' +
+        '<button class="btn-sm" onclick="saveComment(\'' + escapeAttr(filePath) + '\',' + startLine + ',' + endLine + ',' + fileIdx + ')">Add</button>' +
         '<button class="btn-sm btn-cancel" onclick="closeCommentForm()">Cancel</button>' +
       '</div>' +
     '</div>';
@@ -563,7 +697,7 @@ function openCommentForm(afterRow, filePath, lineNum, fileIdx) {
     input.focus();
     input.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-        saveComment(filePath, lineNum, fileIdx);
+        saveComment(filePath, startLine, endLine, fileIdx);
       } else if (e.key === 'Escape') {
         closeCommentForm();
       }
@@ -576,18 +710,23 @@ function closeCommentForm() {
     activeCommentForm.remove();
     activeCommentForm = null;
   }
+  clearLineHighlights();
+  dragAnchor = null;
+  dragCurrent = null;
 }
 
-function saveComment(filePath, lineNum, fileIdx) {
+function saveComment(filePath, startLine, endLine, fileIdx) {
   const input = document.getElementById('commentInput');
   if (!input || !input.value.trim()) return;
 
   comments.push({
     file_path: filePath,
-    start_line: lineNum,
-    end_line: lineNum,
+    start_line: startLine,
+    end_line: endLine,
     comment: input.value.trim()
   });
+
+  var lineLabel = startLine === endLine ? 'Line ' + startLine : 'Lines ' + startLine + '\u2013' + endLine;
 
   // Show saved comment in place of the form
   const row = activeCommentForm;
@@ -596,7 +735,7 @@ function saveComment(filePath, lineNum, fileIdx) {
     td.innerHTML =
       '<div class="saved-comment">' +
         '<div>' +
-          '<div class="comment-meta">Line ' + lineNum + '</div>' +
+          '<div class="comment-meta">' + lineLabel + '</div>' +
           '<div class="comment-text">' + escapeHtml(input.value.trim()) + '</div>' +
         '</div>' +
         '<button class="btn-remove" onclick="removeComment(this, ' + (comments.length - 1) + ', ' + fileIdx + ')">&times;</button>' +
@@ -605,6 +744,7 @@ function saveComment(filePath, lineNum, fileIdx) {
     activeCommentForm = null;
   }
 
+  clearLineHighlights();
   updateCommentCount(fileIdx);
 }
 
@@ -638,6 +778,88 @@ function escapeHtml(s) {
 function escapeAttr(s) {
   return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
 }
+
+function getLineNumFromRow(tr) {
+  if (!tr) return 0;
+  var numEl = tr.querySelector('.line-num2') || tr.querySelector('.line-num1');
+  if (numEl) return parseInt(numEl.textContent.trim(), 10) || 0;
+  var rawNum = tr.querySelector('.raw-line-num');
+  if (rawNum) return parseInt(rawNum.textContent.trim(), 10) || 0;
+  return 0;
+}
+
+function clearLineHighlights() {
+  document.querySelectorAll('.line-selected').forEach(function(el) {
+    el.classList.remove('line-selected');
+  });
+}
+
+function highlightRange(startRow, endRow) {
+  clearLineHighlights();
+  if (!startRow || !endRow) return;
+  if (startRow === endRow) { startRow.classList.add('line-selected'); return; }
+  // Determine DOM order by walking forward from startRow
+  var first = startRow, last = endRow;
+  var node = startRow, found = false;
+  while (node) {
+    if (node === endRow) { found = true; break; }
+    node = node.nextElementSibling;
+  }
+  if (!found) { first = endRow; last = startRow; }
+  node = first;
+  while (node) {
+    node.classList.add('line-selected');
+    if (node === last) break;
+    node = node.nextElementSibling;
+  }
+}
+
+function handleDragStart(e, row, lineNum, filePath, fileIdx) {
+  e.preventDefault();
+  isDragging = true;
+  dragAnchor = {row: row, lineNum: lineNum, filePath: filePath, fileIdx: fileIdx};
+  dragCurrent = {row: row, lineNum: lineNum};
+  document.body.classList.add('is-dragging');
+  if (activeCommentForm) { activeCommentForm.remove(); activeCommentForm = null; }
+  clearLineHighlights();
+  highlightRange(row, row);
+}
+
+function handleDragMove(e) {
+  if (!isDragging || !dragAnchor) return;
+  var el = document.elementFromPoint(e.clientX, e.clientY);
+  if (!el) return;
+  var tr = el.closest('tr');
+  if (!tr) return;
+  // Must be in the same file body
+  var fileBody = tr.closest('.file-body');
+  var anchorBody = dragAnchor.row.closest('.file-body');
+  if (!fileBody || fileBody !== anchorBody) return;
+  var lineNum = getLineNumFromRow(tr);
+  if (lineNum > 0) {
+    dragCurrent = {row: tr, lineNum: lineNum};
+    highlightRange(dragAnchor.row, tr);
+  }
+}
+
+function handleDragEnd(e) {
+  if (!isDragging || !dragAnchor) { isDragging = false; return; }
+  document.body.classList.remove('is-dragging');
+  isDragging = false;
+  var startLine = Math.min(dragAnchor.lineNum, dragCurrent.lineNum);
+  var endLine = Math.max(dragAnchor.lineNum, dragCurrent.lineNum);
+  // Place form after whichever row is lower in the DOM
+  var afterRow = dragCurrent.row;
+  if (dragAnchor.lineNum > dragCurrent.lineNum) afterRow = dragAnchor.row;
+  var filePath = dragAnchor.filePath;
+  var fileIdx = dragAnchor.fileIdx;
+  dragAnchor = null;
+  dragCurrent = null;
+  openCommentForm(afterRow, filePath, startLine, fileIdx, endLine);
+}
+
+document.addEventListener('mousemove', handleDragMove);
+document.addEventListener('mouseup', handleDragEnd);
 
 function submitFeedback() {
   const overall = document.getElementById('overallFeedback').value;
