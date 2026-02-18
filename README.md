@@ -5,7 +5,7 @@ A tool for iteratively developing and evaluating **skills** — system prompts t
 ## Prerequisites
 
 - **Python 3.10+**
-- **Claude Code CLI** installed and on PATH:
+- **Claude Code CLI** (or a compatible wrapper) installed and on PATH:
   ```bash
   npm install -g @anthropic-ai/claude-code
   ```
@@ -23,6 +23,8 @@ python3 run_skill.py
 # Non-interactive demo (builds a calculator, evaluates it)
 python3 run_demo.py
 ```
+
+On first run, a setup wizard will ask which CLI command to use (default: `claude`) and run a quick smoke test. Configuration is saved to `~/.skilliterator/config.json`. Re-run the wizard anytime with `--setup`.
 
 ## How It Works
 
@@ -173,6 +175,16 @@ This is for when Claude has already run and you have uncommitted changes in the 
 
 Useful when you've been manually testing a skill and want to formalize the evaluation.
 
+### Setup Wizard (--setup)
+
+Re-run the CLI agent configuration wizard:
+
+```bash
+python3 run_skill.py --setup
+```
+
+The wizard runs automatically on first use (when no config file exists). Use `--setup` to reconfigure the command, extra args, or re-test connectivity. See [CLI Agent Configuration](#cli-agent-configuration) for details.
+
 ### Interactive Mode
 
 When prompted "Interactive mode? (y/n)", choosing `y` gives Claude full terminal access — it can ask you questions, propose plans for your approval, and use its full interactive feature set. File diffs are still computed from before/after snapshots.
@@ -199,16 +211,20 @@ Expectations are the automated checks derived from your feedback:
 
 ### FileExpectation
 
-Checks a file's existence and contents.
+Checks a file's existence and contents. Supports both exact paths and glob patterns.
 
 | Field | Description |
 |---|---|
-| `path` | Relative path from project root |
+| `path` | Relative path from project root (mutually exclusive with `path_pattern`) |
+| `path_pattern` | Glob pattern, e.g. `"Tests/**/*.swift"` (supports `**`, `*`, `?`) |
 | `should_exist` | Whether the file should exist (default: true) |
 | `content_contains` | Exact substrings that must be present |
 | `content_not_contains` | Exact substrings that must be absent |
 | `content_matches` | Python regex patterns to match |
 | `min_lines` / `max_lines` | Line count bounds |
+| `min_matching_files` | Minimum files matching `path_pattern` (default: 1) |
+
+When `path_pattern` is used, the evaluator finds all matching files and runs the content checks against each one. This is useful for feedback like "all test files should import Testing" — it becomes a single expectation that checks every file matching `Tests/**/*.swift`.
 
 ### CommandExpectation
 
@@ -219,7 +235,26 @@ Runs a command and checks the result.
 | `command` | Command as a list of strings (e.g., `["swift", "build"]`) |
 | `returncode` | Expected exit code (default: 0) |
 | `stdout_contains` | Substrings expected in stdout |
+| `stdout_not_contains` | Substrings that must NOT appear in stdout |
+| `stderr_contains` | Substrings expected in stderr |
+| `stderr_not_contains` | Substrings that must NOT appear in stderr |
 | `timeout` | Seconds before timeout (default: 30) |
+
+Stderr checks are useful for catching compiler warnings or deprecation notices. For example, "no warnings during build" becomes a `stderr_not_contains` check.
+
+### DiffExpectation
+
+Constraints on what files were changed during the run.
+
+| Field | Description |
+|---|---|
+| `allowed_statuses` | Restrict diffs to these statuses (e.g., `["added"]` for new files only) |
+| `allowed_path_patterns` | Every changed file must match at least one pattern |
+| `disallowed_path_patterns` | No changed file may match any of these patterns |
+| `min_files_changed` / `max_files_changed` | Bounds on how many files were changed |
+| `must_include_paths` | Specific paths that must appear in the diffs |
+
+DiffExpectations are useful for scoping feedback like "should only add new files under Tests/", "must not modify any source files", or "should change exactly 2 files". They check the actual file diffs from the Claude run, not the project state.
 
 ### SyntaxExpectation
 
@@ -230,17 +265,21 @@ Validates syntax (currently Python only via `ast.parse`).
 | `path` | File to check |
 | `language` | `"python"` (only supported option) |
 
-You don't write these by hand — they're generated from your plain-English feedback. But understanding what's available helps you give effective feedback (e.g., "the code should compile" becomes a CommandExpectation; "don't use XCTest" becomes a content_not_contains check).
+You don't write these by hand — they're generated from your plain-English feedback. But understanding what's available helps you give effective feedback (e.g., "the code should compile" becomes a CommandExpectation; "don't use XCTest" becomes a content_not_contains check; "should only add files under Tests/" becomes a DiffExpectation).
 
 ## Architecture
 
 ```
-claude_gym.py     Drives the `claude` CLI via subprocess. Handles streaming
-                  JSON events, file snapshots, diff computation, timeout
-                  watchdogs. Zero third-party dependencies.
+config.py         CLI agent configuration — AgentConfig dataclass, config
+                  file I/O (~/.skilliterator/config.json), flag overrides,
+                  env var handling, smoke test, and setup wizard.
 
-evaluator.py      Defines expectation types and verification logic. Can
-                  evaluate any project state against structured criteria.
+claude_gym.py     Drives the CLI agent via subprocess. Handles streaming
+                  JSON events, file snapshots, diff computation, timeout
+                  watchdogs. Uses AgentConfig for command building.
+
+evaluator.py      Defines expectation types (FileExpectation, CommandExpectation,
+                  DiffExpectation, SyntaxExpectation) and verification logic.
 
 diff_server.py    Local HTTP server + browser UI for reviewing diffs with
                   inline commenting. Returns structured feedback.
@@ -252,6 +291,61 @@ run_skill.py      Interactive loop wiring the above together with
 run_demo.py       Non-interactive demo that runs a predefined calculator
                   task through the evaluator.
 ```
+
+## CLI Agent Configuration
+
+The tool supports custom CLI agents — company-internal wrappers around Claude that use the same flags and stream-json output format but are invoked via a different command or require extra flags.
+
+Configuration is stored in `~/.skilliterator/config.json`:
+
+```json
+{
+  "command": "claude",
+  "extra_args": [],
+  "flag_overrides": {},
+  "env_vars": {},
+  "nesting_guard_vars": ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]
+}
+```
+
+| Field | Purpose | Example |
+|---|---|---|
+| `command` | CLI binary name or path | `"acme-claude"` |
+| `extra_args` | Args inserted after the command, before other flags | `["--team", "eng"]` |
+| `flag_overrides` | Rename flags (string value) or suppress them (`null`) | `{"--verbose": null}` |
+| `env_vars` | Extra environment variables for the subprocess | `{"AUTH_TOKEN": "..."}` |
+| `nesting_guard_vars` | Env vars to strip to prevent nesting detection | defaults shown above |
+
+### Setup Wizard
+
+The wizard runs on first use (no config file) or when you pass `--setup`:
+
+```
+$ python3 run_skill.py --setup
+==================================================
+  Skill Iterator — First-Run Setup
+==================================================
+
+CLI command [claude]: acme-claude
+  Found: /usr/local/bin/acme-claude
+
+Extra args (e.g. --team eng) [none]: --team eng
+
+[Running smoke test...]
+  Smoke test passed.
+
+Config saved to ~/.skilliterator/config.json
+```
+
+### Flag Overrides
+
+Flag overrides let you rename or suppress individual CLI flags:
+
+- **Rename:** `{"--model": "--acme-model"}` — uses `--acme-model` wherever `--model` would appear
+- **Suppress:** `{"--verbose": null}` — omits `--verbose` from all commands
+- **Unset flags pass through unchanged** — any flag not in `flag_overrides` is used as-is
+
+This is useful when a wrapper CLI uses different flag names or doesn't support certain flags.
 
 ## Safety
 
