@@ -378,3 +378,7 @@ The evaluator takes precautions to avoid damaging your project:
 - **Include build commands.** "Should compile with `swift build --build-tests`" becomes a CommandExpectation.
 - **Say what's wrong AND what's right.** "The structure is good but it's missing edge case tests" prevents the skill update from breaking what works.
 - **Use the inline comments.** Pointing at specific lines gives the skill updater precise context about what to fix.
+
+## License
+
+MIT — see [LICENSE](LICENSE) for details.
