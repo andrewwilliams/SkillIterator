@@ -8,10 +8,8 @@ use `--resume <session_id>`.
 
 from __future__ import annotations
 
-import difflib
-import hashlib
 import json
-import os
+import re
 import signal
 import subprocess
 import sys
@@ -23,15 +21,6 @@ from pathlib import Path
 from typing import Callable
 
 from config import AgentConfig, build_base_command, build_env, resolve_flag
-
-
-@dataclass
-class FileSnapshot:
-    path: str
-    content: str | None  # None if binary
-    sha256: str
-    size: int
-    mtime: float
 
 
 @dataclass
@@ -74,9 +63,6 @@ class ConversationLog:
         return sum(t.num_turns for t in self.turns)
 
 
-HIDDEN_DIRS = {".git", ".claude", "__pycache__", ".mypy_cache", ".pytest_cache"}
-
-
 class ClaudeGym:
     """Drives the `claude` CLI via subprocess with structured JSON streaming."""
 
@@ -97,6 +83,15 @@ class ClaudeGym:
         self._owns_work_dir = work_dir is None
         if work_dir is None:
             self._work_dir = Path(tempfile.mkdtemp(prefix="claude_gym_"))
+            # Initialize a git repo so git-based diffing works everywhere
+            subprocess.run(
+                ["git", "init"], cwd=str(self._work_dir),
+                capture_output=True, check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-m", "init"],
+                cwd=str(self._work_dir), capture_output=True, check=True,
+            )
         else:
             self._work_dir = Path(work_dir)
             self._work_dir.mkdir(parents=True, exist_ok=True)
@@ -197,97 +192,125 @@ class ClaudeGym:
     def _build_env(self) -> dict[str, str]:
         return build_env(self.agent_config)
 
-    def _snapshot_directory(self) -> dict[str, FileSnapshot]:
-        snapshots: dict[str, FileSnapshot] = {}
-        work = self._work_dir
+    def _git_ensure_baseline(self) -> str:
+        """Capture the HEAD SHA to diff against later.
 
-        for root, dirs, files in os.walk(work):
-            # Filter out hidden directories in-place
-            dirs[:] = [d for d in dirs if d not in HIDDEN_DIRS and not d.startswith(".")]
+        For owned temp dirs, commits any pre-existing setup files so they
+        don't appear as Claude's changes. For real projects, just reads HEAD.
+        """
+        work = str(self._work_dir)
+        if self._owns_work_dir:
+            subprocess.run(
+                ["git", "add", "-A"], cwd=work,
+                capture_output=True, check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-m", "baseline"],
+                cwd=work, capture_output=True, check=True,
+            )
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=work,
+            capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
 
-            for fname in files:
-                if fname.startswith("."):
-                    continue
-                fpath = Path(root) / fname
-                rel = str(fpath.relative_to(work))
-                try:
-                    stat = fpath.stat()
-                    raw = fpath.read_bytes()
-                    sha = hashlib.sha256(raw).hexdigest()
-                    try:
-                        content = raw.decode("utf-8")
-                    except UnicodeDecodeError:
-                        content = None
-                    snapshots[rel] = FileSnapshot(
-                        path=rel,
-                        content=content,
-                        sha256=sha,
-                        size=stat.st_size,
-                        mtime=stat.st_mtime,
-                    )
-                except (OSError, PermissionError):
-                    continue
+    def _parse_git_diff_output(self, diff_output: str) -> list[tuple[str, str]]:
+        """Split multi-file git diff output into (path, diff_text) pairs."""
+        chunks: list[tuple[str, str]] = []
+        # Split on "diff --git" boundaries
+        parts = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+        for part in parts:
+            part = part.strip()
+            if not part.startswith("diff --git "):
+                continue
+            # Extract path from "diff --git a/foo b/foo"
+            header_match = re.match(r"diff --git a/(.*?) b/(.*)", part.split("\n")[0])
+            if header_match:
+                path = header_match.group(2)
+            else:
+                continue
+            chunks.append((path, part))
+        return chunks
 
-        return snapshots
+    def _git_diff_untracked(self, path: str) -> str:
+        """Produce unified diff text for an untracked (new) file."""
+        work = str(self._work_dir)
+        result = subprocess.run(
+            ["git", "diff", "--no-index", "/dev/null", path],
+            cwd=work, capture_output=True, text=True,
+        )
+        # git diff --no-index returns 1 when files differ, which is expected
+        return result.stdout
 
-    def _compute_diffs(
-        self,
-        before: dict[str, FileSnapshot],
-        after: dict[str, FileSnapshot],
-    ) -> list[FileDiff]:
+    def _git_compute_diffs(self, baseline_sha: str) -> list[FileDiff]:
+        """Compute file diffs between baseline_sha and the current working tree."""
+        work = str(self._work_dir)
         diffs: list[FileDiff] = []
 
-        # Added files
-        for path in sorted(set(after) - set(before)):
-            snap = after[path]
-            content = snap.content or "<binary>"
-            diff_text = "\n".join(
-                difflib.unified_diff(
-                    [], content.splitlines(),
-                    fromfile="/dev/null", tofile=path, lineterm=""
-                )
-            )
+        # 1. Classify tracked changes (added/modified/deleted)
+        name_status = subprocess.run(
+            ["git", "diff", baseline_sha, "--name-status"],
+            cwd=work, capture_output=True, text=True,
+        )
+        tracked_files: dict[str, str] = {}  # path -> status letter
+        for line in name_status.stdout.strip().splitlines():
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                tracked_files[parts[1]] = parts[0]
+
+        # 2. Get unified diff for tracked changes
+        tracked_diff = subprocess.run(
+            ["git", "diff", baseline_sha],
+            cwd=work, capture_output=True, text=True,
+        )
+        tracked_chunks = {
+            path: text for path, text in self._parse_git_diff_output(tracked_diff.stdout)
+        }
+
+        # 3. Find untracked (new) files
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=work, capture_output=True, text=True,
+        )
+        untracked_files = [
+            f for f in untracked.stdout.strip().splitlines() if f
+        ]
+
+        # Build FileDiff objects for tracked changes
+        status_map = {"A": "added", "M": "modified", "D": "deleted"}
+        for path, letter in sorted(tracked_files.items()):
+            status = status_map.get(letter, "modified")
+            diff_text = tracked_chunks.get(path, "")
+            diffs.append(FileDiff(
+                path=path, status=status,
+                unified_diff=diff_text,
+                before_hash=None, after_hash=None,
+            ))
+
+        # Build FileDiff objects for untracked files
+        for path in sorted(untracked_files):
+            diff_text = self._git_diff_untracked(path)
             diffs.append(FileDiff(
                 path=path, status="added",
                 unified_diff=diff_text,
-                before_hash=None, after_hash=snap.sha256,
+                before_hash=None, after_hash=None,
             ))
-
-        # Deleted files
-        for path in sorted(set(before) - set(after)):
-            snap = before[path]
-            content = snap.content or "<binary>"
-            diff_text = "\n".join(
-                difflib.unified_diff(
-                    content.splitlines(), [],
-                    fromfile=path, tofile="/dev/null", lineterm=""
-                )
-            )
-            diffs.append(FileDiff(
-                path=path, status="deleted",
-                unified_diff=diff_text,
-                before_hash=snap.sha256, after_hash=None,
-            ))
-
-        # Modified files
-        for path in sorted(set(before) & set(after)):
-            b, a = before[path], after[path]
-            if b.sha256 != a.sha256:
-                b_lines = (b.content or "<binary>").splitlines()
-                a_lines = (a.content or "<binary>").splitlines()
-                diff_text = "\n".join(
-                    difflib.unified_diff(
-                        b_lines, a_lines,
-                        fromfile=f"a/{path}", tofile=f"b/{path}", lineterm=""
-                    )
-                )
-                diffs.append(FileDiff(
-                    path=path, status="modified",
-                    unified_diff=diff_text,
-                    before_hash=b.sha256, after_hash=a.sha256,
-                ))
 
         return diffs
+
+    def compute_working_tree_diffs(self) -> list[FileDiff]:
+        """Compute diffs of the working tree against HEAD.
+
+        Public method for use by run_skill.py --eval mode.
+        """
+        work = str(self._work_dir)
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=work,
+            capture_output=True, text=True, check=True,
+        )
+        return self._git_compute_diffs(result.stdout.strip())
 
     def _debug_print_event(self, event: dict) -> None:
         etype = event.get("type")
@@ -342,8 +365,8 @@ class ClaudeGym:
 
         t0 = time.time()
 
-        # Snapshot before
-        before = self._snapshot_directory()
+        # Record baseline commit to diff against after Claude runs
+        baseline = self._git_ensure_baseline()
 
         # Build and run command
         cmd = self._build_command(prompt, resume_session=self._session_id)
@@ -412,9 +435,8 @@ class ClaudeGym:
                         "id": cb.get("id"),
                     })
 
-        # Snapshot after and compute diffs
-        after = self._snapshot_directory()
-        file_diffs = self._compute_diffs(before, after)
+        # Compute diffs against baseline
+        file_diffs = self._git_compute_diffs(baseline)
 
         turn = TurnResult(
             prompt=prompt,
@@ -435,12 +457,12 @@ class ClaudeGym:
         """Run claude interactively, letting it own the terminal.
 
         The user can interact with Claude directly (answer questions,
-        approve plan mode, etc.). File diffs are computed from before/after
-        snapshots. Structured event data (cost, turns) is not available.
+        approve plan mode, etc.). File diffs are computed via git.
+        Structured event data (cost, turns) is not available.
         """
         t0 = time.time()
 
-        before = self._snapshot_directory()
+        baseline = self._git_ensure_baseline()
 
         cmd = self._build_command(prompt, resume_session=self._session_id)
         if self.debug_mode:
@@ -457,8 +479,7 @@ class ClaudeGym:
 
         duration = time.time() - t0
 
-        after = self._snapshot_directory()
-        file_diffs = self._compute_diffs(before, after)
+        file_diffs = self._git_compute_diffs(baseline)
 
         turn = TurnResult(
             prompt=prompt,
@@ -528,15 +549,13 @@ class ClaudeGym:
             return None
 
     def list_files(self) -> list[str]:
-        """List all non-hidden files in work_dir."""
-        files: list[str] = []
-        for root, dirs, fnames in os.walk(self._work_dir):
-            dirs[:] = [d for d in dirs if d not in HIDDEN_DIRS and not d.startswith(".")]
-            for fname in fnames:
-                if not fname.startswith("."):
-                    rel = str(Path(root, fname).relative_to(self._work_dir))
-                    files.append(rel)
-        return sorted(files)
+        """List all files in work_dir, respecting .gitignore."""
+        result = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=str(self._work_dir),
+            capture_output=True, text=True,
+        )
+        return sorted(f for f in result.stdout.strip().splitlines() if f)
 
     def teardown(self) -> None:
         """Clean up work directory if we created it."""

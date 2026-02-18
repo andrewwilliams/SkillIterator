@@ -669,16 +669,9 @@ def main() -> int:
     diff_exps: list[DiffExpectation] = []
 
     if args.eval:
-        # Compute diffs from the dirty working tree using ClaudeGym's snapshot/diff logic
+        # Compute diffs of the dirty working tree against HEAD
         gym = ClaudeGym(work_dir=project_dir, agent_config=config)
-        after = gym._snapshot_directory()
-        # Stash changes to get the clean baseline, then restore
-        subprocess.run(["git", "stash", "--include-untracked"], cwd=str(project_dir),
-                        capture_output=True, timeout=30)
-        before = gym._snapshot_directory()
-        subprocess.run(["git", "stash", "pop"], cwd=str(project_dir),
-                        capture_output=True, timeout=30)
-        eval_diffs = gym._compute_diffs(before, after)
+        eval_diffs = gym.compute_working_tree_diffs()
 
         if eval_diffs:
             show_file_changes(eval_diffs)
