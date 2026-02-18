@@ -25,10 +25,13 @@ import log
 from claude_gym import ClaudeGym, FileDiff
 from config import (
     AgentConfig,
+    add_recent_project,
     build_base_command,
     build_env,
     config_exists,
     load_config,
+    load_recent_projects,
+    remove_recent_project,
     resolve_flag,
     run_setup_wizard,
 )
@@ -824,19 +827,49 @@ def main() -> int:
             break
         print("Error: task prompt cannot be empty.\n")
 
+    recent_projects = load_recent_projects()
     while True:
-        project_dir_str = input("\nProject directory: ").strip()
-        if not project_dir_str:
-            print("Error: please enter a directory path.\n")
+        if recent_projects:
+            print("\nRecent projects:")
+            for i, p in enumerate(recent_projects, 1):
+                label = p.replace(str(Path.home()), "~")
+                print(f"  {i}) {label}")
+            print()
+            choice = input("Choose a number or enter a new path: ").strip()
+        else:
+            choice = input("\nProject directory: ").strip()
+
+        if not choice:
+            print("Error: please enter a directory path or number.\n")
             continue
+
+        # Check if the user entered a number to select a recent project
+        if choice.isdigit() and recent_projects:
+            idx = int(choice) - 1
+            if 0 <= idx < len(recent_projects):
+                project_dir_str = recent_projects[idx]
+            else:
+                print(f"Error: choose 1–{len(recent_projects)} or enter a path.\n")
+                continue
+        else:
+            project_dir_str = choice
+
         project_dir = Path(os.path.expandvars(os.path.expanduser(project_dir_str))).resolve()
         if not project_dir.is_dir():
-            print(f"Error: {project_dir} is not a directory.\n")
+            # If selected from recent list but no longer exists, offer to remove it
+            if choice.isdigit() and recent_projects:
+                print(f"Error: {project_dir} no longer exists.")
+                remove_recent_project(str(project_dir))
+                recent_projects = load_recent_projects()
+                print("  (Removed from recent list.)\n")
+            else:
+                print(f"Error: {project_dir} is not a directory.\n")
             continue
         dir_err = validate_project_dir(project_dir, skip_clean_check=args.eval)
         if dir_err:
             print(f"Error: {dir_err}\n")
             continue
+        add_recent_project(str(project_dir))
         break
 
     interactive_input = input("\nInteractive mode? (y/n) [n]: ").strip().lower()

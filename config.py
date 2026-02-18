@@ -19,6 +19,9 @@ import log
 
 CONFIG_DIR = Path.home() / ".skilliterator"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+PROJECTS_FILE = CONFIG_DIR / "projects.json"
+
+MAX_RECENT_PROJECTS = 20
 
 
 @dataclass
@@ -94,6 +97,38 @@ def build_env(config: AgentConfig) -> dict[str, str]:
         env.pop(var, None)
     env.update(config.env_vars)
     return env
+
+
+def load_recent_projects() -> list[str]:
+    """Read recent project directories from ~/.skilliterator/projects.json."""
+    if not PROJECTS_FILE.is_file():
+        return []
+    try:
+        data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [p for p in data if isinstance(p, str)]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return []
+
+
+def add_recent_project(path: str) -> None:
+    """Add a project directory to the recent list (most recent first, deduped)."""
+    projects = load_recent_projects()
+    # Remove if already present (will be re-added at top)
+    projects = [p for p in projects if p != path]
+    projects.insert(0, path)
+    projects = projects[:MAX_RECENT_PROJECTS]
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    PROJECTS_FILE.write_text(json.dumps(projects, indent=2) + "\n", encoding="utf-8")
+
+
+def remove_recent_project(path: str) -> None:
+    """Remove a project directory from the recent list."""
+    projects = load_recent_projects()
+    projects = [p for p in projects if p != path]
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    PROJECTS_FILE.write_text(json.dumps(projects, indent=2) + "\n", encoding="utf-8")
 
 
 def smoke_test(config: AgentConfig) -> tuple[bool, str]:
