@@ -16,26 +16,64 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from claude_gym import ClaudeGym, TurnResult
+from claude_gym import ClaudeGym, FileDiff, TurnResult
+
+
+def _glob_match(filepath: str, pattern: str) -> bool:
+    """Regex-based glob matching: ** (zero+ dirs), * (single segment), ? (single char)."""
+    i, regex = 0, []
+    while i < len(pattern):
+        if pattern[i:i+2] == '**':
+            i += 2
+            if i < len(pattern) and pattern[i] == '/':
+                regex.append('(.*/)?')
+                i += 1
+            else:
+                regex.append('.*')
+        elif pattern[i] == '*':
+            regex.append('[^/]*')
+            i += 1
+        elif pattern[i] == '?':
+            regex.append('[^/]')
+            i += 1
+        else:
+            regex.append(re.escape(pattern[i]))
+            i += 1
+    return bool(re.fullmatch(''.join(regex), filepath))
 
 
 @dataclass
 class FileExpectation:
-    path: str
+    path: str = ""
+    path_pattern: str = ""  # glob (e.g. "Tests/**/*.swift")
     should_exist: bool = True
     content_contains: list[str] = field(default_factory=list)
     content_matches: list[str] = field(default_factory=list)  # regex patterns
     content_not_contains: list[str] = field(default_factory=list)
     min_lines: int | None = None
     max_lines: int | None = None
+    min_matching_files: int | None = None  # min files matching path_pattern
 
 
 @dataclass
 class CommandExpectation:
     command: list[str]
     stdout_contains: list[str] = field(default_factory=list)
+    stdout_not_contains: list[str] = field(default_factory=list)
+    stderr_contains: list[str] = field(default_factory=list)
+    stderr_not_contains: list[str] = field(default_factory=list)
     returncode: int = 0
     timeout: int = 30
+
+
+@dataclass
+class DiffExpectation:
+    allowed_statuses: list[str] = field(default_factory=list)  # e.g. ["added"]
+    allowed_path_patterns: list[str] = field(default_factory=list)  # every diff must match one
+    disallowed_path_patterns: list[str] = field(default_factory=list)  # no diff may match any
+    min_files_changed: int | None = None
+    max_files_changed: int | None = None
+    must_include_paths: list[str] = field(default_factory=list)  # paths that must be in diffs
 
 
 @dataclass
@@ -53,6 +91,7 @@ class TaskDefinition:
     file_expectations: list[FileExpectation] = field(default_factory=list)
     command_expectations: list[CommandExpectation] = field(default_factory=list)
     syntax_expectations: list[SyntaxExpectation] = field(default_factory=list)
+    diff_expectations: list[DiffExpectation] = field(default_factory=list)
     max_turns: int = 10
     timeout: int = 300
     setup_files: dict[str, str] = field(default_factory=dict)  # path -> content
@@ -60,7 +99,7 @@ class TaskDefinition:
 
 @dataclass
 class CheckResult:
-    check_type: str  # "file", "syntax", "command"
+    check_type: str  # "file", "syntax", "command", "diff"
     target: str
     passed: bool
     message: str
@@ -139,6 +178,11 @@ class ClaudeEvaluator:
             checks.extend(self._verify_syntax_expectations(gym, task.syntax_expectations))
             checks.extend(self._verify_command_expectations(gym, task.command_expectations))
 
+            # Diff expectations: collect all file_diffs across turns
+            if task.diff_expectations:
+                all_diffs = [d for t in turns for d in t.file_diffs]
+                checks.extend(self._verify_diff_expectations(all_diffs, task.diff_expectations))
+
             all_passed = all(c.passed for c in checks) and error is None
             clean_log = gym.get_clean_log()
 
@@ -172,6 +216,39 @@ class ClaudeEvaluator:
         results: list[CheckResult] = []
 
         for exp in expectations:
+            # Glob-based matching: resolve pattern to concrete files
+            if exp.path_pattern:
+                all_files = gym.list_files()
+                matches = [f for f in all_files if _glob_match(f, exp.path_pattern)]
+                min_required = exp.min_matching_files if exp.min_matching_files is not None else 1
+                if len(matches) < min_required:
+                    results.append(CheckResult(
+                        check_type="file",
+                        target=f"pattern '{exp.path_pattern}'",
+                        passed=False,
+                        message=f"Pattern '{exp.path_pattern}' matched {len(matches)} file(s), need at least {min_required}",
+                    ))
+                    continue
+                results.append(CheckResult(
+                    check_type="file",
+                    target=f"pattern '{exp.path_pattern}'",
+                    passed=True,
+                    message=f"Pattern '{exp.path_pattern}' matched {len(matches)} file(s) (>= {min_required})",
+                ))
+                # Create a concrete FileExpectation for each matched file and recurse
+                for matched_path in matches:
+                    concrete = FileExpectation(
+                        path=matched_path,
+                        should_exist=exp.should_exist,
+                        content_contains=exp.content_contains,
+                        content_matches=exp.content_matches,
+                        content_not_contains=exp.content_not_contains,
+                        min_lines=exp.min_lines,
+                        max_lines=exp.max_lines,
+                    )
+                    results.extend(self._verify_file_expectations(gym, [concrete]))
+                continue
+
             # Check existence
             content = gym.get_file_content(exp.path)
             exists = content is not None
@@ -316,6 +393,39 @@ class ClaudeEvaluator:
                         details=f"stdout: {proc.stdout[:300]}" if not found else "",
                     ))
 
+                # Stdout negative checks
+                for substring in exp.stdout_not_contains:
+                    absent = substring not in proc.stdout
+                    results.append(CheckResult(
+                        check_type="command",
+                        target=f"{cmd_str} stdout excludes '{substring}'",
+                        passed=absent,
+                        message=f"{'Excluded' if absent else 'Found (unexpected)'}: '{substring}' in stdout of `{cmd_str}`",
+                        details=f"stdout: {proc.stdout[:300]}" if not absent else "",
+                    ))
+
+                # Stderr substring checks
+                for substring in exp.stderr_contains:
+                    found = substring in proc.stderr
+                    results.append(CheckResult(
+                        check_type="command",
+                        target=f"{cmd_str} stderr contains '{substring}'",
+                        passed=found,
+                        message=f"{'Found' if found else 'Missing'}: '{substring}' in stderr of `{cmd_str}`",
+                        details=f"stderr: {proc.stderr[:300]}" if not found else "",
+                    ))
+
+                # Stderr negative checks
+                for substring in exp.stderr_not_contains:
+                    absent = substring not in proc.stderr
+                    results.append(CheckResult(
+                        check_type="command",
+                        target=f"{cmd_str} stderr excludes '{substring}'",
+                        passed=absent,
+                        message=f"{'Excluded' if absent else 'Found (unexpected)'}: '{substring}' in stderr of `{cmd_str}`",
+                        details=f"stderr: {proc.stderr[:300]}" if not absent else "",
+                    ))
+
             except subprocess.TimeoutExpired:
                 results.append(CheckResult(
                     check_type="command", target=cmd_str, passed=False,
@@ -325,6 +435,77 @@ class ClaudeEvaluator:
                 results.append(CheckResult(
                     check_type="command", target=cmd_str, passed=False,
                     message=f"Command not found: `{cmd_str}`",
+                ))
+
+        return results
+
+    def _verify_diff_expectations(
+        self, file_diffs: list[FileDiff], expectations: list[DiffExpectation]
+    ) -> list[CheckResult]:
+        results: list[CheckResult] = []
+        diff_count = len(file_diffs)
+        diff_paths = {d.path for d in file_diffs}
+
+        for exp in expectations:
+            # Min/max files changed
+            if exp.min_files_changed is not None:
+                ok = diff_count >= exp.min_files_changed
+                results.append(CheckResult(
+                    check_type="diff",
+                    target=f"min_files_changed={exp.min_files_changed}",
+                    passed=ok,
+                    message=f"{diff_count} file(s) changed (min {exp.min_files_changed})",
+                ))
+            if exp.max_files_changed is not None:
+                ok = diff_count <= exp.max_files_changed
+                results.append(CheckResult(
+                    check_type="diff",
+                    target=f"max_files_changed={exp.max_files_changed}",
+                    passed=ok,
+                    message=f"{diff_count} file(s) changed (max {exp.max_files_changed})",
+                ))
+
+            # Allowed statuses
+            if exp.allowed_statuses:
+                for d in file_diffs:
+                    ok = d.status in exp.allowed_statuses
+                    results.append(CheckResult(
+                        check_type="diff",
+                        target=f"{d.path} status={d.status}",
+                        passed=ok,
+                        message=f"{'OK' if ok else 'FAIL'}: {d.path} status '{d.status}' (allowed: {exp.allowed_statuses})",
+                    ))
+
+            # Allowed path patterns
+            if exp.allowed_path_patterns:
+                for d in file_diffs:
+                    matched = any(_glob_match(d.path, p) for p in exp.allowed_path_patterns)
+                    results.append(CheckResult(
+                        check_type="diff",
+                        target=f"{d.path} matches allowed patterns",
+                        passed=matched,
+                        message=f"{'OK' if matched else 'FAIL'}: {d.path} {'matches' if matched else 'does not match'} any allowed pattern",
+                    ))
+
+            # Disallowed path patterns
+            if exp.disallowed_path_patterns:
+                for d in file_diffs:
+                    forbidden = any(_glob_match(d.path, p) for p in exp.disallowed_path_patterns)
+                    results.append(CheckResult(
+                        check_type="diff",
+                        target=f"{d.path} not in disallowed patterns",
+                        passed=not forbidden,
+                        message=f"{'FAIL' if forbidden else 'OK'}: {d.path} {'matches' if forbidden else 'does not match'} disallowed pattern",
+                    ))
+
+            # Must-include paths
+            for path in exp.must_include_paths:
+                found = path in diff_paths
+                results.append(CheckResult(
+                    check_type="diff",
+                    target=f"must include {path}",
+                    passed=found,
+                    message=f"{'Found' if found else 'Missing'}: {path} in changed files",
                 ))
 
         return results

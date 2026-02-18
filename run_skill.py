@@ -25,6 +25,7 @@ from evaluator import (
     CheckResult,
     ClaudeEvaluator,
     CommandExpectation,
+    DiffExpectation,
     FileExpectation,
 )
 
@@ -232,7 +233,7 @@ def _build_clean_env() -> dict[str, str]:
 
 def derive_expectations(
     feedback: str, project_dir: str, task_prompt: str
-) -> tuple[list[FileExpectation], list[CommandExpectation]]:
+) -> tuple[list[FileExpectation], list[CommandExpectation], list[DiffExpectation]]:
     """Call Claude to convert freeform feedback into structured expectations."""
     derivation_prompt = f"""You are converting user feedback about a coding task into structured JSON expectations.
 
@@ -243,18 +244,20 @@ The task prompt was:
 The user's feedback on the result:
 {feedback}
 
-Convert this into a JSON object with two arrays:
+Convert this into a JSON object with three arrays:
 
 {{
   "file_expectations": [
     {{
       "path": "relative/path/to/file.ext",
+      "path_pattern": "",
       "should_exist": true,
       "content_contains": ["string1", "string2"],
       "content_not_contains": ["bad_string"],
       "content_matches": [],
       "min_lines": null,
-      "max_lines": null
+      "max_lines": null,
+      "min_matching_files": null
     }}
   ],
   "command_expectations": [
@@ -262,7 +265,20 @@ Convert this into a JSON object with two arrays:
       "command": ["swift", "build", "--build-tests"],
       "returncode": 0,
       "stdout_contains": [],
+      "stdout_not_contains": [],
+      "stderr_contains": [],
+      "stderr_not_contains": [],
       "timeout": 60
+    }}
+  ],
+  "diff_expectations": [
+    {{
+      "allowed_statuses": ["added"],
+      "allowed_path_patterns": ["Tests/**/*.swift"],
+      "disallowed_path_patterns": [],
+      "min_files_changed": null,
+      "max_files_changed": null,
+      "must_include_paths": []
     }}
   ]
 }}
@@ -270,11 +286,20 @@ Convert this into a JSON object with two arrays:
 Rules:
 - Infer file paths from the task prompt and feedback context.
 - Only include fields relevant to the feedback.
+- "path" and "path_pattern" are mutually exclusive. Use "path" for a specific file, "path_pattern" for a glob pattern (supports **, *, ?). When using "path_pattern", set "min_matching_files" to the expected minimum number of matches (default 1 if omitted).
 - content_contains: exact substrings to find.
 - content_not_contains: exact substrings that must be absent.
 - content_matches: valid Python regex patterns.
 - command: full command as a list of strings.
+- stdout_not_contains: substrings that must NOT appear in stdout.
+- stderr_contains / stderr_not_contains: check stderr output (e.g. for compiler warnings).
+- diff_expectations: constraints on what files were changed. Use when feedback says things like "should only add files", "should only change files under X/", "must not modify Y".
+  - allowed_statuses: restrict diffs to these statuses (e.g. ["added", "modified"]).
+  - allowed_path_patterns: every changed file must match at least one pattern.
+  - disallowed_path_patterns: no changed file may match any of these patterns.
+  - must_include_paths: specific paths that must appear in the diffs.
 - Use reasonable timeouts (default 30s, build commands 120s).
+- Omit arrays/fields that aren't relevant to the feedback.
 
 Return ONLY the raw JSON object. No markdown fences, no explanation."""
 
@@ -301,13 +326,15 @@ Return ONLY the raw JSON object. No markdown fences, no explanation."""
         for fe in data.get("file_expectations", []):
             file_exps.append(
                 FileExpectation(
-                    path=fe["path"],
+                    path=fe.get("path", ""),
+                    path_pattern=fe.get("path_pattern", ""),
                     should_exist=fe.get("should_exist", True),
                     content_contains=fe.get("content_contains", []),
                     content_matches=fe.get("content_matches", []),
                     content_not_contains=fe.get("content_not_contains", []),
                     min_lines=fe.get("min_lines"),
                     max_lines=fe.get("max_lines"),
+                    min_matching_files=fe.get("min_matching_files"),
                 )
             )
 
@@ -318,30 +345,52 @@ Return ONLY the raw JSON object. No markdown fences, no explanation."""
                     command=ce["command"],
                     returncode=ce.get("returncode", 0),
                     stdout_contains=ce.get("stdout_contains", []),
+                    stdout_not_contains=ce.get("stdout_not_contains", []),
+                    stderr_contains=ce.get("stderr_contains", []),
+                    stderr_not_contains=ce.get("stderr_not_contains", []),
                     timeout=ce.get("timeout", 30),
                 )
             )
 
-        return file_exps, cmd_exps
+        diff_exps: list[DiffExpectation] = []
+        for de in data.get("diff_expectations", []):
+            diff_exps.append(
+                DiffExpectation(
+                    allowed_statuses=de.get("allowed_statuses", []),
+                    allowed_path_patterns=de.get("allowed_path_patterns", []),
+                    disallowed_path_patterns=de.get("disallowed_path_patterns", []),
+                    min_files_changed=de.get("min_files_changed"),
+                    max_files_changed=de.get("max_files_changed"),
+                    must_include_paths=de.get("must_include_paths", []),
+                )
+            )
+
+        return file_exps, cmd_exps, diff_exps
 
     except subprocess.TimeoutExpired:
         print("\nError: derivation call timed out.")
-        return [], []
+        return [], [], []
     except (json.JSONDecodeError, KeyError) as e:
         print(f"\nError parsing derived expectations: {e}")
         if proc.stdout.strip():
             print(f"Raw output:\n{proc.stdout.strip()[:500]}")
-        return [], []
+        return [], [], []
 
 
 def show_expectations(
-    file_exps: list[FileExpectation], cmd_exps: list[CommandExpectation]
+    file_exps: list[FileExpectation],
+    cmd_exps: list[CommandExpectation],
+    diff_exps: list[DiffExpectation] | None = None,
 ) -> None:
     """Display derived expectations for user review."""
     print("\nDerived expectations:")
     for fe in file_exps:
-        exist_str = "exists" if fe.should_exist else "does not exist"
-        print(f"  [+] File: {fe.path} {exist_str}")
+        if fe.path_pattern:
+            min_f = fe.min_matching_files if fe.min_matching_files is not None else 1
+            print(f"  [+] File pattern: {fe.path_pattern} (>= {min_f} match(es))")
+        else:
+            exist_str = "exists" if fe.should_exist else "does not exist"
+            print(f"  [+] File: {fe.path} {exist_str}")
         if fe.content_contains:
             print(f"      Contains: {', '.join(fe.content_contains)}")
         if fe.content_not_contains:
@@ -357,29 +406,49 @@ def show_expectations(
         print(f"  [+] Command: {cmd_str} returns {ce.returncode}")
         if ce.stdout_contains:
             print(f"      Stdout contains: {', '.join(ce.stdout_contains)}")
+        if ce.stdout_not_contains:
+            print(f"      Stdout excludes: {', '.join(ce.stdout_not_contains)}")
+        if ce.stderr_contains:
+            print(f"      Stderr contains: {', '.join(ce.stderr_contains)}")
+        if ce.stderr_not_contains:
+            print(f"      Stderr excludes: {', '.join(ce.stderr_not_contains)}")
+    for de in (diff_exps or []):
+        print(f"  [+] Diff constraint:")
+        if de.allowed_statuses:
+            print(f"      Allowed statuses: {', '.join(de.allowed_statuses)}")
+        if de.allowed_path_patterns:
+            print(f"      Allowed paths: {', '.join(de.allowed_path_patterns)}")
+        if de.disallowed_path_patterns:
+            print(f"      Disallowed paths: {', '.join(de.disallowed_path_patterns)}")
+        if de.min_files_changed is not None:
+            print(f"      Min files changed: {de.min_files_changed}")
+        if de.max_files_changed is not None:
+            print(f"      Max files changed: {de.max_files_changed}")
+        if de.must_include_paths:
+            print(f"      Must include: {', '.join(de.must_include_paths)}")
 
 
 def collect_and_derive_expectations(
     feedback: str, project_dir: Path, task_prompt: str
-) -> tuple[list[FileExpectation], list[CommandExpectation]]:
+) -> tuple[list[FileExpectation], list[CommandExpectation], list[DiffExpectation]]:
     """Derive expectations from feedback, show them, and prompt for acceptance."""
     print("\n[Deriving expectations from feedback...]")
-    file_exps, cmd_exps = derive_expectations(
+    file_exps, cmd_exps, diff_exps = derive_expectations(
         feedback, str(project_dir), task_prompt
     )
 
-    if not file_exps and not cmd_exps:
+    if not file_exps and not cmd_exps and not diff_exps:
         print("Could not derive expectations.")
-        return [], []
+        return [], [], []
 
-    show_expectations(file_exps, cmd_exps)
+    show_expectations(file_exps, cmd_exps, diff_exps)
 
     accept = input("\nAccept? (y/n): ").strip().lower()
     if accept != "y":
         print("Expectations rejected.")
-        return [], []
+        return [], [], []
 
-    return file_exps, cmd_exps
+    return file_exps, cmd_exps, diff_exps
 
 
 def derive_skill_update(
@@ -484,6 +553,8 @@ def run_evaluation(
     project_dir: Path,
     file_exps: list[FileExpectation],
     cmd_exps: list[CommandExpectation],
+    diff_exps: list[DiffExpectation] | None = None,
+    file_diffs: list[FileDiff] | None = None,
 ) -> list[CheckResult]:
     """Run expectation checks against the current project state."""
     gym = ClaudeGym(work_dir=project_dir)
@@ -491,6 +562,8 @@ def run_evaluation(
     checks: list[CheckResult] = []
     checks.extend(evaluator._verify_file_expectations(gym, file_exps))
     checks.extend(evaluator._verify_command_expectations(gym, cmd_exps))
+    if diff_exps and file_diffs is not None:
+        checks.extend(evaluator._verify_diff_expectations(file_diffs, diff_exps))
     return checks
 
 
@@ -563,6 +636,7 @@ def main() -> int:
     # --- Pre-loop expectations (--eval mode) ---
     file_exps: list[FileExpectation] = []
     cmd_exps: list[CommandExpectation] = []
+    diff_exps: list[DiffExpectation] = []
 
     if args.eval:
         # Compute diffs from the dirty working tree using ClaudeGym's snapshot/diff logic
@@ -585,7 +659,7 @@ def main() -> int:
             feedback = get_multiline_input("\nFeedback (or 'done'):")
 
         if feedback.strip().lower() != "done" and feedback.strip():
-            file_exps, cmd_exps = collect_and_derive_expectations(
+            file_exps, cmd_exps, diff_exps = collect_and_derive_expectations(
                 feedback, project_dir, task_prompt
             )
 
@@ -619,7 +693,7 @@ def main() -> int:
 
     while True:
         run_number += 1
-        has_expectations = bool(file_exps or cmd_exps)
+        has_expectations = bool(file_exps or cmd_exps or diff_exps)
 
         # Revert previous changes before re-running (including --eval dirty tree on Run 1)
         if run_number > 1 or (args.eval and (created_files or modified_files)):
@@ -661,7 +735,10 @@ def main() -> int:
         # Auto-evaluate if we have expectations
         checks: list[CheckResult] = []
         if has_expectations:
-            checks = run_evaluation(project_dir, file_exps, cmd_exps)
+            checks = run_evaluation(
+                project_dir, file_exps, cmd_exps,
+                diff_exps=diff_exps, file_diffs=turn.file_diffs,
+            )
             print_evaluation(checks)
 
         # Collect feedback via web diff review UI or terminal
@@ -680,13 +757,14 @@ def main() -> int:
             continue
 
         # Derive expectations from feedback
-        new_file_exps, new_cmd_exps = collect_and_derive_expectations(
+        new_file_exps, new_cmd_exps, new_diff_exps = collect_and_derive_expectations(
             feedback, project_dir, task_prompt
         )
 
-        if new_file_exps or new_cmd_exps:
+        if new_file_exps or new_cmd_exps or new_diff_exps:
             file_exps = new_file_exps
             cmd_exps = new_cmd_exps
+            diff_exps = new_diff_exps
         else:
             print("Running again with existing expectations...")
 
