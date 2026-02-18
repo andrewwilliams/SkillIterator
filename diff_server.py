@@ -11,7 +11,6 @@ Zero third-party Python dependencies. Uses only stdlib + CDN JS/CSS.
 from __future__ import annotations
 
 import json
-import socket
 import threading
 import webbrowser
 from dataclasses import dataclass, field
@@ -83,11 +82,13 @@ def _terminal_fallback(diffs: list[FileDiff]) -> str:
 # Port finder
 # ---------------------------------------------------------------------------
 
-def _find_free_port() -> int:
-    """Bind to port 0 and return the OS-assigned port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _create_server(handler_class: type) -> HTTPServer:
+    """Create an HTTPServer bound to an OS-assigned free port.
+
+    Uses port 0 so the OS assigns and holds the port atomically,
+    avoiding the race condition of bind/release/re-bind.
+    """
+    return HTTPServer(("127.0.0.1", 0), handler_class)
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +481,7 @@ table.d2h-diff-table { font-family: 'SF Mono', 'Fira Code', monospace; font-size
   </div>
   <div class="file-count" id="fileCount"></div>
 </div>
-<div class="hint-bar"><span class="hint-icon">+</span>Click a line number to comment · Drag across lines to select a range</div>
+<div class="hint-bar"><span class="hint-icon">+</span>Click a line number to comment · Drag across lines to select a range · <strong>Ctrl+Enter</strong> to submit · <strong>Esc</strong> to skip</div>
 
 <div class="container">
   <div id="diffContainer"></div>
@@ -489,7 +490,7 @@ table.d2h-diff-table { font-family: 'SF Mono', 'Fira Code', monospace; font-size
     <h2>Overall Feedback</h2>
     <textarea id="overallFeedback" placeholder="Describe what should change overall (e.g., 'tests should use @Test, code should compile cleanly')..."></textarea>
     <div class="actions">
-      <button class="btn btn-secondary" onclick="submitSkip()">Skip <span class="kbd">Esc</span></button>
+      <button class="btn btn-secondary" onclick="submitSkip()" title="Skip without providing feedback">Skip (no feedback) <span class="kbd">Esc</span></button>
       <button class="btn btn-primary" onclick="submitFeedback()">Submit Feedback <span class="kbd">Ctrl+Enter</span></button>
     </div>
   </div>
@@ -984,8 +985,8 @@ def present_diff_for_review(diffs: list[FileDiff], timeout: int = 600) -> str:
     _DiffReviewHandler.cancelled = False
     _DiffReviewHandler.html_content = _build_html(diffs)
 
-    port = _find_free_port()
-    server = HTTPServer(("127.0.0.1", port), _DiffReviewHandler)
+    server = _create_server(_DiffReviewHandler)
+    port = server.server_address[1]
 
     # Run server in daemon thread
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)

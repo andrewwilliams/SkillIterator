@@ -55,16 +55,39 @@ class FileExpectation:
     max_lines: int | None = None
     min_matching_files: int | None = None  # min files matching path_pattern
 
+    def validate(self) -> list[str]:
+        """Return list of validation error messages (empty = valid)."""
+        errors: list[str] = []
+        if not self.path and not self.path_pattern:
+            errors.append("FileExpectation: must set either 'path' or 'path_pattern'")
+        if self.path and self.path_pattern:
+            errors.append("FileExpectation: 'path' and 'path_pattern' are mutually exclusive")
+        for pattern in self.content_matches:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                errors.append(f"FileExpectation: invalid regex '{pattern}': {e}")
+        return errors
+
 
 @dataclass
 class CommandExpectation:
-    command: list[str]
+    command: list[str] = field(default_factory=list)
     stdout_contains: list[str] = field(default_factory=list)
     stdout_not_contains: list[str] = field(default_factory=list)
     stderr_contains: list[str] = field(default_factory=list)
     stderr_not_contains: list[str] = field(default_factory=list)
     returncode: int = 0
     timeout: int = 30
+
+    def validate(self) -> list[str]:
+        """Return list of validation error messages (empty = valid)."""
+        errors: list[str] = []
+        if not self.command:
+            errors.append("CommandExpectation: command list is empty")
+        if self.timeout <= 0:
+            errors.append(f"CommandExpectation: timeout must be > 0, got {self.timeout}")
+        return errors
 
 
 @dataclass
@@ -75,6 +98,16 @@ class DiffExpectation:
     min_files_changed: int | None = None
     max_files_changed: int | None = None
     must_include_paths: list[str] = field(default_factory=list)  # paths that must be in diffs
+
+    _valid_statuses = {"added", "modified", "deleted", "renamed", "copied", "type_changed"}
+
+    def validate(self) -> list[str]:
+        """Return list of validation error messages (empty = valid)."""
+        errors: list[str] = []
+        for s in self.allowed_statuses:
+            if s not in self._valid_statuses:
+                errors.append(f"DiffExpectation: invalid status '{s}' (valid: {self._valid_statuses})")
+        return errors
 
 
 @dataclass

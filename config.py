@@ -15,6 +15,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import log
+
 CONFIG_DIR = Path.home() / ".skilliterator"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
@@ -45,7 +47,8 @@ def load_config() -> AgentConfig:
                 "nesting_guard_vars", ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]
             ),
         )
-    except (json.JSONDecodeError, TypeError, AttributeError):
+    except (json.JSONDecodeError, TypeError, AttributeError) as e:
+        log.warn(f"Malformed config at {CONFIG_FILE}: {e}. Using defaults.")
         return AgentConfig()
 
 
@@ -111,18 +114,19 @@ def smoke_test(config: AgentConfig) -> tuple[bool, str]:
     if of_flag:
         cmd.extend([of_flag, "stream-json"])
 
+    cmd_str = " ".join(cmd)
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
             env=build_env(config),
         )
     except FileNotFoundError:
-        return False, f"Command not found: {config.command}"
+        return False, f"Command not found: {config.command} (ran: {cmd_str})"
     except subprocess.TimeoutExpired:
-        return False, "Smoke test timed out after 30s."
+        return False, f"Smoke test timed out after 60s (ran: {cmd_str})"
 
     if proc.returncode != 0:
         stderr_snippet = proc.stderr.strip()[:200] if proc.stderr else "(no stderr)"
@@ -144,17 +148,24 @@ def smoke_test(config: AgentConfig) -> tuple[bool, str]:
 
 
 def run_setup_wizard() -> AgentConfig:
-    """Interactive first-run setup wizard."""
+    """Interactive first-run setup wizard. Shows current values as defaults when editing."""
+    existing = load_config() if config_exists() else AgentConfig()
+    is_edit = config_exists()
+
     print("=" * 50)
-    print("  Skill Iterator — First-Run Setup")
+    if is_edit:
+        print("  Skill Iterator — Edit Configuration")
+    else:
+        print("  Skill Iterator — First-Run Setup")
     print("=" * 50)
     print()
     print("This wizard configures which CLI agent command to use.")
-    print("Most users can accept the defaults (just press Enter).\n")
+    print("Press Enter to keep the current value.\n")
 
     # 1. Command
-    cmd_input = input("CLI command [claude]: ").strip()
-    command = cmd_input if cmd_input else "claude"
+    default_cmd = existing.command
+    cmd_input = input(f"CLI command [{default_cmd}]: ").strip()
+    command = cmd_input if cmd_input else default_cmd
 
     # 2. Check if command exists on PATH
     found = shutil.which(command)
@@ -168,8 +179,14 @@ def run_setup_wizard() -> AgentConfig:
             return run_setup_wizard()  # restart
 
     # 3. Extra args
-    args_input = input("\nExtra args (e.g. --team eng) [none]: ").strip()
-    extra_args = shlex.split(args_input) if args_input else []
+    default_args = " ".join(existing.extra_args) if existing.extra_args else "none"
+    args_input = input(f"\nExtra args (e.g. --team eng) [{default_args}]: ").strip()
+    if args_input:
+        extra_args = shlex.split(args_input)
+    elif is_edit:
+        extra_args = list(existing.extra_args)
+    else:
+        extra_args = []
 
     config = AgentConfig(command=command, extra_args=extra_args)
 

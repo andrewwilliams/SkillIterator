@@ -8,6 +8,7 @@ use `--resume <session_id>`.
 
 from __future__ import annotations
 
+import atexit
 import json
 import re
 import signal
@@ -20,16 +21,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+import log
 from config import AgentConfig, build_base_command, build_env, resolve_flag
+
+MAX_DIFF_SIZE = 5 * 1024 * 1024  # 5 MB
 
 
 @dataclass
 class FileDiff:
     path: str
-    status: str  # "added", "modified", "deleted"
+    status: str  # "added", "modified", "deleted", "renamed", "copied", "type_changed"
     unified_diff: str
     before_hash: str | None
     after_hash: str | None
+    old_path: str | None = None
 
 
 @dataclass
@@ -44,6 +49,7 @@ class TurnResult:
     raw_events: list[dict]
     tool_uses: list[dict]
     file_diffs: list[FileDiff]
+    stderr_text: str = ""
 
 
 @dataclass
@@ -108,7 +114,11 @@ class ClaudeGym:
         self.agent_config = agent_config or AgentConfig()
 
         self._session_id: str | None = None
+        self._torn_down = False
         self.conversation_log = ConversationLog()
+
+        if self._owns_work_dir:
+            atexit.register(self.teardown)
 
     @property
     def work_dir(self) -> Path:
@@ -247,26 +257,63 @@ class ClaudeGym:
         work = str(self._work_dir)
         diffs: list[FileDiff] = []
 
-        # 1. Classify tracked changes (added/modified/deleted)
+        # 1. Classify tracked changes using NUL-terminated output for safety
         name_status = subprocess.run(
-            ["git", "diff", baseline_sha, "--name-status"],
+            ["git", "diff", baseline_sha, "--name-status", "-z"],
             cwd=work, capture_output=True, text=True,
         )
-        tracked_files: dict[str, str] = {}  # path -> status letter
-        for line in name_status.stdout.strip().splitlines():
-            if not line:
+        if name_status.returncode != 0 and name_status.returncode != 1:
+            log.warn(f"git diff --name-status exited with code {name_status.returncode}: "
+                     f"{name_status.stderr.strip()[:200]}")
+        status_map = {
+            "A": "added", "M": "modified", "D": "deleted",
+            "R": "renamed", "C": "copied", "T": "type_changed",
+        }
+        # path -> (status_str, old_path_or_None)
+        tracked_files: dict[str, tuple[str, str | None]] = {}
+        # Parse NUL-terminated: fields are separated by \0
+        # Format: STATUS\0path\0  or  STATUS\0old_path\0new_path\0 (for R/C)
+        raw = name_status.stdout
+        fields = raw.split("\0")
+        i = 0
+        while i < len(fields):
+            entry = fields[i].strip()
+            if not entry:
+                i += 1
                 continue
-            parts = line.split("\t", 1)
-            if len(parts) == 2:
-                tracked_files[parts[1]] = parts[0]
+            # Status letter is first char; R100, C095 etc. have a percentage suffix
+            letter = entry[0]
+            if letter in ("R", "C"):
+                # Rename/copy: next two fields are old_path, new_path
+                if i + 2 < len(fields):
+                    old_path = fields[i + 1]
+                    new_path = fields[i + 2]
+                    status = status_map.get(letter, "modified")
+                    tracked_files[new_path] = (status, old_path)
+                    i += 3
+                else:
+                    i += 1
+            else:
+                # Normal: next field is path
+                if i + 1 < len(fields):
+                    path = fields[i + 1]
+                    status = status_map.get(letter, "modified")
+                    tracked_files[path] = (status, None)
+                    i += 2
+                else:
+                    i += 1
 
         # 2. Get unified diff for tracked changes
         tracked_diff = subprocess.run(
             ["git", "diff", baseline_sha],
             cwd=work, capture_output=True, text=True,
         )
+        diff_output = tracked_diff.stdout
+        if len(diff_output) > MAX_DIFF_SIZE:
+            log.warn(f"Diff output is {len(diff_output)} bytes (>{MAX_DIFF_SIZE}), truncating.")
+            diff_output = diff_output[:MAX_DIFF_SIZE]
         tracked_chunks = {
-            path: text for path, text in self._parse_git_diff_output(tracked_diff.stdout)
+            path: text for path, text in self._parse_git_diff_output(diff_output)
         }
 
         # 3. Find untracked (new) files
@@ -279,14 +326,16 @@ class ClaudeGym:
         ]
 
         # Build FileDiff objects for tracked changes
-        status_map = {"A": "added", "M": "modified", "D": "deleted"}
-        for path, letter in sorted(tracked_files.items()):
-            status = status_map.get(letter, "modified")
+        for path, (status, old_path) in sorted(tracked_files.items()):
             diff_text = tracked_chunks.get(path, "")
+            # For renames, diff may be keyed by old_path
+            if not diff_text and old_path:
+                diff_text = tracked_chunks.get(old_path, "")
             diffs.append(FileDiff(
                 path=path, status=status,
                 unified_diff=diff_text,
                 before_hash=None, after_hash=None,
+                old_path=old_path,
             ))
 
         # Build FileDiff objects for untracked files
@@ -333,9 +382,10 @@ class ClaudeGym:
                 file=sys.stderr, flush=True,
             )
 
-    def _parse_stream_events(self, process: subprocess.Popen) -> tuple[list[dict], dict | None]:
+    def _parse_stream_events(self, process: subprocess.Popen) -> tuple[list[dict], dict | None, int]:
         events: list[dict] = []
         result_event: dict | None = None
+        skipped_lines = 0
 
         for raw_line in process.stdout:
             line = raw_line.strip()
@@ -344,6 +394,8 @@ class ClaudeGym:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                skipped_lines += 1
+                log.debug(f"[skip] non-JSON: {line[:120]}")
                 continue
 
             events.append(event)
@@ -356,7 +408,7 @@ class ClaudeGym:
             if event.get("type") == "result":
                 result_event = event
 
-        return events, result_event
+        return events, result_event, skipped_lines
 
     def send_prompt(self, prompt: str, timeout: int = 300) -> TurnResult:
         """Send a prompt to claude and return structured results."""
@@ -371,8 +423,8 @@ class ClaudeGym:
         # Build and run command
         cmd = self._build_command(prompt, resume_session=self._session_id)
         if self.debug_mode:
-            print(f"\n>>> Prompt: {prompt[:120]}...", file=sys.stderr, flush=True)
-            print(f">>> Command: {' '.join(cmd[:8])}...", file=sys.stderr, flush=True)
+            log.debug(f"\n>>> Prompt: {prompt[:120]}...")
+            log.debug(f">>> Command: {' '.join(cmd[:8])}...")
 
         process = subprocess.Popen(
             cmd,
@@ -383,12 +435,26 @@ class ClaudeGym:
             text=True,
         )
 
+        # Drain stderr in a background thread to prevent pipe deadlock
+        stderr_chunks: list[str] = []
+
+        def _drain_stderr():
+            try:
+                for line in process.stderr:
+                    stderr_chunks.append(line)
+            except ValueError:
+                pass  # Stream closed
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         # Timeout watchdog
         timed_out = threading.Event()
 
         def _watchdog():
-            if not timed_out.wait(timeout):
-                return
+            if timed_out.wait(timeout):
+                return  # Process finished normally, don't kill
+            # Timeout elapsed — kill it
             try:
                 process.send_signal(signal.SIGTERM)
                 process.wait(timeout=5)
@@ -402,9 +468,14 @@ class ClaudeGym:
         watchdog.start()
 
         # Parse events
-        events, result_event = self._parse_stream_events(process)
+        events, result_event, skipped_lines = self._parse_stream_events(process)
         process.wait()
         timed_out.set()  # Cancel watchdog
+        stderr_thread.join(timeout=2)
+        stderr_text = "".join(stderr_chunks)
+
+        if skipped_lines:
+            log.debug(f"Skipped {skipped_lines} non-JSON line(s) from stream")
 
         duration = time.time() - t0
 
@@ -449,6 +520,7 @@ class ClaudeGym:
             raw_events=events,
             tool_uses=tool_uses,
             file_diffs=file_diffs,
+            stderr_text=stderr_text,
         )
         self.conversation_log.turns.append(turn)
         return turn
@@ -466,8 +538,8 @@ class ClaudeGym:
 
         cmd = self._build_command(prompt, resume_session=self._session_id)
         if self.debug_mode:
-            print(f"\n>>> Interactive mode", file=sys.stderr, flush=True)
-            print(f">>> Command: {' '.join(cmd[:8])}...", file=sys.stderr, flush=True)
+            log.debug(f"\n>>> Interactive mode")
+            log.debug(f">>> Command: {' '.join(cmd[:8])}...")
 
         # Let Claude own stdin/stdout/stderr for full interactivity
         process = subprocess.Popen(
@@ -559,6 +631,12 @@ class ClaudeGym:
 
     def teardown(self) -> None:
         """Clean up work directory if we created it."""
+        if self._torn_down:
+            return
+        self._torn_down = True
         if self._owns_work_dir and self._work_dir.exists():
             import shutil
-            shutil.rmtree(self._work_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(self._work_dir)
+            except OSError as e:
+                log.warn(f"Failed to clean up temp dir {self._work_dir}: {e}")

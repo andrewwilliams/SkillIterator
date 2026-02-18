@@ -18,8 +18,10 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
+import log
 from claude_gym import ClaudeGym, FileDiff
 from config import (
     AgentConfig,
@@ -41,6 +43,52 @@ from evaluator import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILLS_DIR = Path.home() / ".claude" / "skills"
+SESSION_FILE = Path.home() / ".skilliterator" / "session.json"
+MAX_INPUT_LINES = 500
+
+
+def save_session(
+    skill: str, task_prompt: str, project_dir: str,
+    file_exps: list[FileExpectation], cmd_exps: list[CommandExpectation],
+    diff_exps: list[DiffExpectation], run_number: int,
+) -> None:
+    """Persist session state so a crashed/interrupted run can be resumed."""
+    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "session_id": str(uuid.uuid4()),
+        "skill": skill,
+        "task_prompt": task_prompt,
+        "project_dir": project_dir,
+        "run_number": run_number,
+        "file_expectations": [
+            {k: v for k, v in fe.__dict__.items()} for fe in file_exps
+        ],
+        "command_expectations": [
+            {k: v for k, v in ce.__dict__.items()} for ce in cmd_exps
+        ],
+        "diff_expectations": [
+            {k: v for k, v in de.__dict__.items() if not k.startswith("_")} for de in diff_exps
+        ],
+    }
+    SESSION_FILE.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def load_session() -> dict | None:
+    """Load saved session if it exists."""
+    if not SESSION_FILE.is_file():
+        return None
+    try:
+        return json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def delete_session() -> None:
+    """Remove saved session file."""
+    try:
+        SESSION_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def discover_skills() -> list[dict[str, str]]:
@@ -118,6 +166,15 @@ def validate_project_dir(project_dir: Path, *, skip_clean_check: bool = False) -
     # Block dangerous directories
     home = Path.home().resolve()
     dangerous = {Path("/").resolve(), home}
+    # Block system directories
+    for sys_dir in ["/var", "/etc", "/usr", "/System", "/Library", "/Applications"]:
+        p = Path(sys_dir)
+        if p.exists():
+            dangerous.add(p.resolve())
+    # Block parent directories of home (e.g. /Users)
+    for parent in home.parents:
+        if parent != Path("/").resolve():
+            dangerous.add(parent)
     if project_dir in dangerous:
         return f"Refusing to run in {project_dir} — too dangerous."
 
@@ -185,6 +242,9 @@ def get_multiline_input(prompt: str) -> str:
         if line == "":
             break
         lines.append(line)
+        if len(lines) >= MAX_INPUT_LINES:
+            print(f"  (Input truncated at {MAX_INPUT_LINES} lines)")
+            break
     return "\n".join(lines)
 
 
@@ -195,8 +255,9 @@ def show_file_changes(diffs: list[FileDiff]) -> None:
         return
     print("\nFiles changed:")
     for d in diffs:
-        symbol = {"added": "+", "modified": "~", "deleted": "-"}.get(d.status, "?")
-        print(f"  {symbol} {d.path} ({d.status})")
+        symbol = {"added": "+", "modified": "~", "deleted": "-", "renamed": "R", "copied": "C", "type_changed": "T"}.get(d.status, "?")
+        suffix = f" (from {d.old_path})" if d.old_path else ""
+        print(f"  {symbol} {d.path} ({d.status}){suffix}")
 
 
 def revert_changes(
@@ -379,12 +440,16 @@ Return ONLY the raw JSON object. No markdown fences, no explanation."""
         return file_exps, cmd_exps, diff_exps
 
     except subprocess.TimeoutExpired:
-        print("\nError: derivation call timed out.")
+        print(f"\nError: derivation call timed out after 60s (prompt was {len(derivation_prompt)} chars).")
         return [], [], []
     except (json.JSONDecodeError, KeyError) as e:
         print(f"\nError parsing derived expectations: {e}")
-        if proc.stdout.strip():
-            print(f"Raw output:\n{proc.stdout.strip()[:500]}")
+        try:
+            raw = proc.stdout.strip()  # type: ignore[possibly-undefined]
+            if raw:
+                print(f"Raw output (first 500 chars):\n{raw[:500]}")
+        except NameError:
+            pass  # proc was never assigned
         return [], [], []
 
 
@@ -439,6 +504,61 @@ def show_expectations(
             print(f"      Must include: {', '.join(de.must_include_paths)}")
 
 
+def _edit_expectations(
+    file_exps: list[FileExpectation],
+    cmd_exps: list[CommandExpectation],
+    diff_exps: list[DiffExpectation],
+) -> tuple[list[FileExpectation], list[CommandExpectation], list[DiffExpectation]]:
+    """Let user delete individual expectations by number."""
+    # Build a numbered list of all expectations
+    items: list[tuple[str, str, int]] = []  # (type, label, index_in_list)
+    for i, fe in enumerate(file_exps):
+        label = f"File: {fe.path or fe.path_pattern}"
+        items.append(("file", label, i))
+    for i, ce in enumerate(cmd_exps):
+        label = f"Command: {' '.join(ce.command)}"
+        items.append(("cmd", label, i))
+    for i, de in enumerate(diff_exps):
+        label = f"Diff constraint"
+        items.append(("diff", label, i))
+
+    print("\nExpectations (enter numbers to remove, comma-separated):")
+    for idx, (_, label, _) in enumerate(items, 1):
+        print(f"  {idx}. {label}")
+
+    to_remove = input("\nRemove (e.g. 1,3) or Enter to keep all: ").strip()
+    if not to_remove:
+        return file_exps, cmd_exps, diff_exps
+
+    try:
+        remove_indices = {int(x.strip()) - 1 for x in to_remove.split(",") if x.strip()}
+    except ValueError:
+        print("Invalid input, keeping all expectations.")
+        return file_exps, cmd_exps, diff_exps
+
+    # Track which indices to remove per type
+    file_remove = set()
+    cmd_remove = set()
+    diff_remove = set()
+    for idx in remove_indices:
+        if 0 <= idx < len(items):
+            typ, _, list_idx = items[idx]
+            if typ == "file":
+                file_remove.add(list_idx)
+            elif typ == "cmd":
+                cmd_remove.add(list_idx)
+            elif typ == "diff":
+                diff_remove.add(list_idx)
+
+    new_file = [e for i, e in enumerate(file_exps) if i not in file_remove]
+    new_cmd = [e for i, e in enumerate(cmd_exps) if i not in cmd_remove]
+    new_diff = [e for i, e in enumerate(diff_exps) if i not in diff_remove]
+
+    removed = len(file_remove) + len(cmd_remove) + len(diff_remove)
+    print(f"  Removed {removed} expectation(s).")
+    return new_file, new_cmd, new_diff
+
+
 def collect_and_derive_expectations(
     feedback: str, project_dir: Path, task_prompt: str,
     config: AgentConfig | None = None,
@@ -453,14 +573,37 @@ def collect_and_derive_expectations(
         print("Could not derive expectations.")
         return [], [], []
 
+    # Validate derived expectations
+    validation_errors: list[str] = []
+    for fe in file_exps:
+        validation_errors.extend(fe.validate())
+    for ce in cmd_exps:
+        validation_errors.extend(ce.validate())
+    for de in diff_exps:
+        validation_errors.extend(de.validate())
+    if validation_errors:
+        print("\nValidation warnings:")
+        for err in validation_errors:
+            print(f"  ! {err}")
+
     show_expectations(file_exps, cmd_exps, diff_exps)
 
-    accept = input("\nAccept? (y/n): ").strip().lower()
-    if accept != "y":
-        print("Expectations rejected.")
-        return [], [], []
-
-    return file_exps, cmd_exps, diff_exps
+    while True:
+        choice = input("\n(a)ccept / (e)dit / (r)eject: ").strip().lower()
+        if choice in ("a", "accept"):
+            return file_exps, cmd_exps, diff_exps
+        elif choice in ("r", "reject"):
+            print("Expectations rejected.")
+            return [], [], []
+        elif choice in ("e", "edit"):
+            file_exps, cmd_exps, diff_exps = _edit_expectations(file_exps, cmd_exps, diff_exps)
+            if not file_exps and not cmd_exps and not diff_exps:
+                print("All expectations removed.")
+                return [], [], []
+            show_expectations(file_exps, cmd_exps, diff_exps)
+            # Loop back to accept/edit/reject
+        else:
+            print("Please enter 'a', 'e', or 'r'.")
 
 
 def derive_skill_update(
@@ -611,7 +754,11 @@ def main() -> int:
                         help="Skip exploratory run — provide expectations upfront")
     parser.add_argument("--setup", action="store_true",
                         help="Re-run the CLI agent setup wizard")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose debug output")
     args = parser.parse_args()
+
+    log.set_verbose(args.verbose)
 
     print("=== Skill Evaluator ===\n")
 
@@ -626,6 +773,46 @@ def main() -> int:
     if prereq_err:
         print(f"Error: {prereq_err}")
         return 1
+
+    # --- Check for resumable session ---
+    saved = load_session()
+    if saved and not args.eval:
+        print(f"Found saved session (run {saved.get('run_number', '?')}):")
+        print(f"  Skill:   {saved.get('skill', '?')[:80]}...")
+        print(f"  Project: {saved.get('project_dir', '?')}")
+        resume = input("\nResume? (y/n) [n]: ").strip().lower()
+        if resume == "y":
+            skill = saved["skill"]
+            task_prompt = saved["task_prompt"]
+            project_dir = Path(saved["project_dir"]).resolve()
+            # Reconstruct expectations
+            file_exps = [FileExpectation(**fe) for fe in saved.get("file_expectations", [])]
+            cmd_exps = [CommandExpectation(**ce) for ce in saved.get("command_expectations", [])]
+            diff_exps = [DiffExpectation(**de) for de in saved.get("diff_expectations", [])]
+            run_number = saved.get("run_number", 0)
+
+            dir_err = validate_project_dir(project_dir, skip_clean_check=True)
+            if dir_err:
+                print(f"Error: {dir_err}")
+                delete_session()
+                return 1
+
+            interactive_input = input("\nInteractive mode? (y/n) [n]: ").strip().lower()
+            interactive = interactive_input == "y"
+
+            branch = get_git_branch(project_dir)
+            print(f"\nProject: {project_dir}")
+            print(f"Branch:  {branch}")
+
+            # Jump to main loop
+            created_files: list[str] = []
+            modified_files: list[str] = []
+            # Skip to iteration loop below
+            return _run_loop(
+                skill, task_prompt, project_dir, config, interactive,
+                file_exps, cmd_exps, diff_exps, run_number,
+                created_files, modified_files, args,
+            )
 
     # --- Collect inputs ---
     skills = discover_skills()
@@ -642,7 +829,7 @@ def main() -> int:
         if not project_dir_str:
             print("Error: please enter a directory path.\n")
             continue
-        project_dir = Path(os.path.expanduser(project_dir_str)).resolve()
+        project_dir = Path(os.path.expandvars(os.path.expanduser(project_dir_str))).resolve()
         if not project_dir.is_dir():
             print(f"Error: {project_dir} is not a directory.\n")
             continue
@@ -714,6 +901,22 @@ def main() -> int:
             elif diff.status == "modified":
                 modified_files.append(diff.path)
 
+    return _run_loop(
+        skill, task_prompt, project_dir, config, interactive,
+        file_exps, cmd_exps, diff_exps, run_number,
+        created_files, modified_files, args,
+    )
+
+
+def _run_loop(
+    skill: str, task_prompt: str, project_dir: Path,
+    config: AgentConfig, interactive: bool,
+    file_exps: list[FileExpectation], cmd_exps: list[CommandExpectation],
+    diff_exps: list[DiffExpectation], run_number: int,
+    created_files: list[str], modified_files: list[str],
+    args: argparse.Namespace,
+) -> int:
+    """Main iteration loop. Extracted so both normal and resume paths can use it."""
     while True:
         run_number += 1
         has_expectations = bool(file_exps or cmd_exps or diff_exps)
@@ -724,9 +927,27 @@ def main() -> int:
             revert_changes(project_dir, created_files, modified_files)
             created_files = []
             modified_files = []
+            # Verify revert succeeded
+            try:
+                status = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(project_dir), capture_output=True, text=True, timeout=10,
+                )
+                if status.stdout.strip():
+                    dirty = len(status.stdout.strip().splitlines())
+                    log.warn(f"Working tree still has {dirty} change(s) after revert. "
+                             "Results may be inconsistent.")
+            except Exception:
+                pass  # Best-effort check
 
         label = "(evaluated)" if has_expectations else "(exploratory)"
         print(f"\n--- Run {run_number} {label} ---")
+
+        # Save session state before running
+        save_session(
+            skill, task_prompt, str(project_dir),
+            file_exps, cmd_exps, diff_exps, run_number,
+        )
 
         # Run Claude in the real project
         gym = ClaudeGym(
@@ -775,6 +996,7 @@ def main() -> int:
 
         if feedback.strip().lower() == "done":
             print("\nDone.")
+            delete_session()
             break
 
         if not feedback.strip():
