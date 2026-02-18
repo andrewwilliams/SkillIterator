@@ -98,7 +98,7 @@ You'll be prompted for:
 
 1. **Skill** — select from discovered skills or enter a custom one
 2. **Task prompt** — what Claude should do (e.g., "Write unit tests for Sources/Models/User.swift")
-3. **Project directory** — absolute path to a git repo with a clean working tree
+3. **Project directory** — select from recent projects or enter a path to a git repo with a clean working tree
 4. **Interactive mode** — whether you can interact with Claude during the run (answer questions, approve plans)
 
 #### Run 1: Exploratory
@@ -291,6 +291,20 @@ run_skill.py      Interactive loop wiring the above together with
 run_demo.py       Non-interactive demo that runs a predefined calculator
                   task through the evaluator.
 ```
+
+## Recent Projects
+
+Project directories are saved automatically when you use them. On subsequent runs, you'll see a numbered menu of recent projects instead of typing the full path:
+
+```
+Recent projects:
+  1) ~/Documents/GitHub/MyApp
+  2) ~/Projects/SomeOtherProject
+
+Choose a number or enter a new path: 1
+```
+
+The list is stored in `~/.skilliterator/projects.json` (up to 20 entries, most recent first). Directories that no longer exist are removed automatically.
 
 ## CLI Agent Configuration
 

@@ -94,6 +94,9 @@ python3 run_skill.py     # Interactive skill evaluation loop
 python3 run_demo.py      # Non-interactive demo (calculator task)
 ```
 
+### README maintenance
+After any change that adds, removes, or modifies user-facing functionality (new CLI flags, new config options, changed interactive prompts, new expectation types, new files in the architecture, etc.), review `README.md` and update it if the change would make existing documentation inaccurate or incomplete. Don't update the README for internal refactors, bug fixes, or test changes that don't affect the user-facing interface. When in doubt, check if the README describes the thing you changed — if it does, update it.
+
 ### Design principles
 - **No temp directories.** Skills should be evaluated against real projects with real build systems, real dependencies, real file structures. Git provides the safety net.
 - **No changes to lower layers for upper-layer features.** `run_skill.py` works entirely through the public interfaces of `claude_gym.py` and `evaluator.py`. If you need new verification logic, add it to `evaluator.py`. If you need new Claude interaction patterns, add them to `claude_gym.py`.
