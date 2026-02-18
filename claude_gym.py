@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from config import AgentConfig, build_base_command, build_env, resolve_flag
+
 
 @dataclass
 class FileSnapshot:
@@ -90,6 +92,7 @@ class ClaudeGym:
         allowed_tools: list[str] | None = None,
         stream_callback: Callable[[dict], None] | None = None,
         interactive: bool = False,
+        agent_config: AgentConfig | None = None,
     ):
         self._owns_work_dir = work_dir is None
         if work_dir is None:
@@ -107,6 +110,7 @@ class ClaudeGym:
         self.allowed_tools = allowed_tools
         self.stream_callback = stream_callback
         self.interactive = interactive
+        self.agent_config = agent_config or AgentConfig()
 
         self._session_id: str | None = None
         self.conversation_log = ConversationLog()
@@ -122,59 +126,68 @@ class ClaudeGym:
         self.teardown()
         return False
 
+    def _add_flag(self, cmd: list[str], canonical_flag: str, value: str | None = None) -> None:
+        """Append a flag (and optional value) to cmd, respecting flag_overrides."""
+        resolved = resolve_flag(self.agent_config, canonical_flag)
+        if resolved is None:
+            return
+        cmd.append(resolved)
+        if value is not None:
+            cmd.append(value)
+
     def _build_command(self, prompt: str, resume_session: str | None = None) -> list[str]:
         if self.interactive:
             return self._build_interactive_command(prompt, resume_session)
 
-        cmd = [
-            "claude",
-            "-p", prompt,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--max-turns", str(self.max_turns),
-        ]
+        cmd = list(build_base_command(self.agent_config))
+        self._add_flag(cmd, "-p", prompt)
+        self._add_flag(cmd, "--output-format", "stream-json")
+        self._add_flag(cmd, "--verbose")
+        self._add_flag(cmd, "--max-turns", str(self.max_turns))
 
         if self.permission_mode:
-            cmd.extend(["--permission-mode", self.permission_mode])
+            self._add_flag(cmd, "--permission-mode", self.permission_mode)
 
         if self.debug_mode or self.stream_callback:
-            cmd.append("--include-partial-messages")
+            self._add_flag(cmd, "--include-partial-messages")
 
         if resume_session:
-            cmd.extend(["--resume", resume_session])
+            self._add_flag(cmd, "--resume", resume_session)
 
         if self.model:
-            cmd.extend(["--model", self.model])
+            self._add_flag(cmd, "--model", self.model)
 
         if self.max_budget_usd is not None:
-            cmd.extend(["--max-budget-usd", str(self.max_budget_usd)])
+            self._add_flag(cmd, "--max-budget-usd", str(self.max_budget_usd))
 
         if self.system_prompt:
-            cmd.extend(["--system-prompt", self.system_prompt])
+            self._add_flag(cmd, "--system-prompt", self.system_prompt)
 
         if self.allowed_tools:
-            cmd.extend(["--allowedTools"] + self.allowed_tools)
+            self._add_flag(cmd, "--allowedTools")
+            cmd.extend(self.allowed_tools)
 
         return cmd
 
     def _build_interactive_command(self, prompt: str, resume_session: str | None = None) -> list[str]:
-        cmd = ["claude"]
+        cmd = list(build_base_command(self.agent_config))
 
         if resume_session:
-            cmd.extend(["--resume", resume_session])
+            self._add_flag(cmd, "--resume", resume_session)
 
         if self.model:
-            cmd.extend(["--model", self.model])
+            self._add_flag(cmd, "--model", self.model)
 
         # No --max-turns in interactive mode: the user controls the session
         if self.max_budget_usd is not None:
-            cmd.extend(["--max-budget-usd", str(self.max_budget_usd)])
+            self._add_flag(cmd, "--max-budget-usd", str(self.max_budget_usd))
 
         if self.system_prompt:
-            cmd.extend(["--system-prompt", self.system_prompt])
+            self._add_flag(cmd, "--system-prompt", self.system_prompt)
 
         if self.allowed_tools:
-            cmd.extend(["--allowedTools"] + self.allowed_tools)
+            self._add_flag(cmd, "--allowedTools")
+            cmd.extend(self.allowed_tools)
 
         # Prompt goes as positional argument at the end
         cmd.append(prompt)
@@ -182,12 +195,7 @@ class ClaudeGym:
         return cmd
 
     def _build_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        # Nesting guard: claude refuses to start if it detects it's inside
-        # another claude session via these env vars.
-        env.pop("CLAUDECODE", None)
-        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-        return env
+        return build_env(self.agent_config)
 
     def _snapshot_directory(self) -> dict[str, FileSnapshot]:
         snapshots: dict[str, FileSnapshot] = {}

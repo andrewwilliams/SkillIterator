@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_gym import ClaudeGym, FileDiff, TurnResult
+from config import AgentConfig
 
 
 def _glob_match(filepath: str, pattern: str) -> bool:
@@ -136,9 +137,11 @@ class TaskResult:
 class ClaudeEvaluator:
     """Runs tasks through ClaudeGym and verifies outcomes."""
 
-    def __init__(self, debug_mode: bool = False, model: str | None = None):
+    def __init__(self, debug_mode: bool = False, model: str | None = None,
+                 agent_config: AgentConfig | None = None):
         self.debug_mode = debug_mode
         self.model = model
+        self.agent_config = agent_config
 
     def run_task(self, task: TaskDefinition) -> TaskResult:
         """Execute a task and verify all expectations."""
@@ -146,6 +149,7 @@ class ClaudeEvaluator:
             debug_mode=self.debug_mode,
             model=self.model,
             max_turns=task.max_turns,
+            agent_config=self.agent_config,
         )
 
         turns: list[TurnResult] = []

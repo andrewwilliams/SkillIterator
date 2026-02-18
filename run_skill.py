@@ -21,6 +21,15 @@ import sys
 from pathlib import Path
 
 from claude_gym import ClaudeGym, FileDiff
+from config import (
+    AgentConfig,
+    build_base_command,
+    build_env,
+    config_exists,
+    load_config,
+    resolve_flag,
+    run_setup_wizard,
+)
 from evaluator import (
     CheckResult,
     ClaudeEvaluator,
@@ -96,10 +105,11 @@ def select_skill(skills: list[dict[str, str]]) -> str:
         print("Error: skill cannot be empty.\n")
 
 
-def check_prerequisites() -> str | None:
+def check_prerequisites(config: AgentConfig | None = None) -> str | None:
     """Return an error message if prerequisites aren't met, else None."""
-    if not shutil.which("claude"):
-        return "'claude' CLI not found on PATH. Install it first."
+    command = config.command if config else "claude"
+    if not shutil.which(command):
+        return f"'{command}' CLI not found on PATH. Install it first."
     return None
 
 
@@ -223,16 +233,9 @@ def revert_changes(
             print(f"  Warning: git checkout failed: {e.stderr.strip()}")
 
 
-def _build_clean_env() -> dict[str, str]:
-    """Build an env dict that strips Claude nesting-guard variables."""
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-    return env
-
-
 def derive_expectations(
-    feedback: str, project_dir: str, task_prompt: str
+    feedback: str, project_dir: str, task_prompt: str,
+    config: AgentConfig | None = None,
 ) -> tuple[list[FileExpectation], list[CommandExpectation], list[DiffExpectation]]:
     """Call Claude to convert freeform feedback into structured expectations."""
     derivation_prompt = f"""You are converting user feedback about a coding task into structured JSON expectations.
@@ -304,12 +307,20 @@ Rules:
 Return ONLY the raw JSON object. No markdown fences, no explanation."""
 
     try:
+        cfg = config or AgentConfig()
+        cmd = list(build_base_command(cfg))
+        p_flag = resolve_flag(cfg, "-p")
+        if p_flag:
+            cmd.extend([p_flag, derivation_prompt])
+        else:
+            cmd.append(derivation_prompt)
+
         proc = subprocess.run(
-            ["claude", "-p", derivation_prompt],
+            cmd,
             capture_output=True,
             text=True,
             timeout=60,
-            env=_build_clean_env(),
+            env=build_env(cfg),
         )
 
         text = proc.stdout.strip()
@@ -429,12 +440,13 @@ def show_expectations(
 
 
 def collect_and_derive_expectations(
-    feedback: str, project_dir: Path, task_prompt: str
+    feedback: str, project_dir: Path, task_prompt: str,
+    config: AgentConfig | None = None,
 ) -> tuple[list[FileExpectation], list[CommandExpectation], list[DiffExpectation]]:
     """Derive expectations from feedback, show them, and prompt for acceptance."""
     print("\n[Deriving expectations from feedback...]")
     file_exps, cmd_exps, diff_exps = derive_expectations(
-        feedback, str(project_dir), task_prompt
+        feedback, str(project_dir), task_prompt, config=config,
     )
 
     if not file_exps and not cmd_exps and not diff_exps:
@@ -456,6 +468,7 @@ def derive_skill_update(
     feedback: str,
     task_prompt: str,
     checks: list[CheckResult] | None = None,
+    config: AgentConfig | None = None,
 ) -> str | None:
     """Call Claude to propose a revised skill based on feedback and evaluation results."""
     eval_context = ""
@@ -493,12 +506,20 @@ Revise the skill to address the feedback. Guidelines:
 Return ONLY the complete revised skill text. No explanation, no markdown fences, no preamble."""
 
     try:
+        cfg = config or AgentConfig()
+        cmd = list(build_base_command(cfg))
+        p_flag = resolve_flag(cfg, "-p")
+        if p_flag:
+            cmd.extend([p_flag, revision_prompt])
+        else:
+            cmd.append(revision_prompt)
+
         proc = subprocess.run(
-            ["claude", "-p", revision_prompt],
+            cmd,
             capture_output=True,
             text=True,
             timeout=90,
-            env=_build_clean_env(),
+            env=build_env(cfg),
         )
 
         revised = proc.stdout.strip()
@@ -555,10 +576,11 @@ def run_evaluation(
     cmd_exps: list[CommandExpectation],
     diff_exps: list[DiffExpectation] | None = None,
     file_diffs: list[FileDiff] | None = None,
+    config: AgentConfig | None = None,
 ) -> list[CheckResult]:
     """Run expectation checks against the current project state."""
-    gym = ClaudeGym(work_dir=project_dir)
-    evaluator = ClaudeEvaluator()
+    gym = ClaudeGym(work_dir=project_dir, agent_config=config)
+    evaluator = ClaudeEvaluator(agent_config=config)
     checks: list[CheckResult] = []
     checks.extend(evaluator._verify_file_expectations(gym, file_exps))
     checks.extend(evaluator._verify_command_expectations(gym, cmd_exps))
@@ -587,12 +609,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Interactive Skill Evaluator")
     parser.add_argument("--eval", action="store_true",
                         help="Skip exploratory run — provide expectations upfront")
+    parser.add_argument("--setup", action="store_true",
+                        help="Re-run the CLI agent setup wizard")
     args = parser.parse_args()
 
     print("=== Skill Evaluator ===\n")
 
+    # --- Config ---
+    if args.setup or not config_exists():
+        config = run_setup_wizard()
+    else:
+        config = load_config()
+
     # --- Prerequisites ---
-    prereq_err = check_prerequisites()
+    prereq_err = check_prerequisites(config)
     if prereq_err:
         print(f"Error: {prereq_err}")
         return 1
@@ -640,7 +670,7 @@ def main() -> int:
 
     if args.eval:
         # Compute diffs from the dirty working tree using ClaudeGym's snapshot/diff logic
-        gym = ClaudeGym(work_dir=project_dir)
+        gym = ClaudeGym(work_dir=project_dir, agent_config=config)
         after = gym._snapshot_directory()
         # Stash changes to get the clean baseline, then restore
         subprocess.run(["git", "stash", "--include-untracked"], cwd=str(project_dir),
@@ -660,13 +690,13 @@ def main() -> int:
 
         if feedback.strip().lower() != "done" and feedback.strip():
             file_exps, cmd_exps, diff_exps = collect_and_derive_expectations(
-                feedback, project_dir, task_prompt
+                feedback, project_dir, task_prompt, config=config,
             )
 
             # Propose skill update based on feedback
             print("\n[Proposing skill update...]")
             revised_skill = derive_skill_update(
-                skill, feedback, task_prompt
+                skill, feedback, task_prompt, config=config,
             )
             if revised_skill:
                 print("\nProposed skill changes:")
@@ -711,6 +741,7 @@ def main() -> int:
             system_prompt=skill,
             debug_mode=not interactive,
             interactive=interactive,
+            agent_config=config,
         )
         turn = gym.send_prompt(task_prompt)
 
@@ -738,6 +769,7 @@ def main() -> int:
             checks = run_evaluation(
                 project_dir, file_exps, cmd_exps,
                 diff_exps=diff_exps, file_diffs=turn.file_diffs,
+                config=config,
             )
             print_evaluation(checks)
 
@@ -758,7 +790,7 @@ def main() -> int:
 
         # Derive expectations from feedback
         new_file_exps, new_cmd_exps, new_diff_exps = collect_and_derive_expectations(
-            feedback, project_dir, task_prompt
+            feedback, project_dir, task_prompt, config=config,
         )
 
         if new_file_exps or new_cmd_exps or new_diff_exps:
@@ -771,7 +803,7 @@ def main() -> int:
         # Propose skill update based on feedback
         print("\n[Proposing skill update...]")
         revised_skill = derive_skill_update(
-            skill, feedback, task_prompt, checks or None
+            skill, feedback, task_prompt, checks or None, config=config,
         )
         if revised_skill:
             print("\nProposed skill changes:")

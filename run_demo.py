@@ -8,6 +8,7 @@ Usage:
 
 import sys
 
+from config import load_config
 from evaluator import (
     ClaudeEvaluator,
     CommandExpectation,
@@ -75,7 +76,7 @@ CALCULATOR_TASK = TaskDefinition(
 
 
 def main() -> int:
-    evaluator = ClaudeEvaluator(debug_mode=True)
+    evaluator = ClaudeEvaluator(debug_mode=True, agent_config=load_config())
     results = evaluator.run_suite([CALCULATOR_TASK])
     evaluator.print_report(results)
 
